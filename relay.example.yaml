@@ -1,0 +1,38 @@
+# Arcane APNs relay configuration.
+# Every key is optional; environment variables (RELAY_* / APNS_*) override file values.
+
+listen: ":3554"
+database_path: ./data/relay.db
+
+# 32 random bytes, hex or base64. Encrypts device tokens at rest. `just gen-key` makes one.
+# encryption_key: ""
+# encryption_key_file: /run/secrets/relay_encryption_key
+
+max_envelope_age: 5m     # reject envelopes whose occurredAt is older than this
+max_body_bytes: 65536
+workers: 8               # concurrent APNs sends
+max_attempts: 8          # retries for 5xx/429 before a delivery is marked failed
+retention: 24h           # how long finished deliveries / event ids are kept for idempotency
+trust_proxy_headers: false  # set true only behind a proxy that overwrites X-Forwarded-For
+
+log:
+  level: info            # debug | info | warn | error
+  format: json           # json | text
+
+rate_limits:
+  ip_per_minute: 60
+  channel_per_minute: 600
+  installation_per_minute: 60
+
+apns:
+  mode: live             # live | log  (log = print instead of sending; local dev only)
+  key_id: ABC123DEFG
+  team_id: TEAM123456
+  topic: com.getarcaneapp.ios.mobile
+  key_file: /run/secrets/AuthKey_ABC123DEFG.p8
+  # key: |
+  #   -----BEGIN PRIVATE KEY-----
+  #   ...
+  #   -----END PRIVATE KEY-----
+  # sandbox_url: https://api.sandbox.push.apple.com
+  # production_url: https://api.push.apple.com

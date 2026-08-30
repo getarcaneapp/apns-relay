@@ -1,0 +1,16 @@
+FROM gcr.io/distroless/static-debian13:nonroot
+
+ARG TARGETPLATFORM
+
+WORKDIR /app
+
+COPY ${TARGETPLATFORM}/apns-relay ./apns-relay
+
+ENV RELAY_LISTEN_ADDR=:3554
+ENV RELAY_DATABASE_PATH=/app/data/relay.db
+ENV RELAY_CONFIG=/app/config/relay.yaml
+
+EXPOSE 3554
+VOLUME ["/app/data"]
+
+ENTRYPOINT ["/app/apns-relay"]

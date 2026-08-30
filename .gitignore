@@ -32,3 +32,12 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Relay runtime
+/data/
+/dist/
+relay.yaml
+*.p8
+
+# Custom golangci-lint build
+/.bin/

@@ -1,0 +1,140 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema-pro.json
+# vim: set ts=2 sw=2 tw=0 fo=jcroql
+version: 2
+pro: true
+
+project_name: apns-relay
+
+builds:
+  - id: apns-relay
+    main: ./cmd/main.go
+    binary: apns-relay
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+      - arm
+      - riscv64
+    goarm:
+      - '7'
+    goamd64:
+      - v1
+    goriscv64:
+      - rva20u64
+    ignore:
+      - goos: darwin
+        goarch: riscv64
+      - goos: darwin
+        goarch: arm
+    ldflags:
+      - -w -s
+      - -buildid={{ .Version }}
+      - -X github.com/getarcaneapp/apns-relay/internal/config.Version={{ .Version }}
+      - -X github.com/getarcaneapp/apns-relay/internal/config.Revision={{ .ShortCommit }}
+      - -X github.com/getarcaneapp/apns-relay/internal/config.BuildTime={{ .Date }}
+    flags:
+      - -trimpath
+    mod_timestamp: '{{ .CommitTimestamp }}'
+
+archives:
+  - id: default
+    ids:
+      - apns-relay
+    formats:
+      - binary
+    name_template: '{{ .Binary }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}'
+
+signs:
+  - id: cosign-checksums
+    cmd: cosign
+    artifacts: checksum
+    signature: '${artifact}.sigstore.json'
+    stdin: '{{ .Env.COSIGN_PASSWORD }}'
+    args:
+      - sign-blob
+      - --key=env://COSIGN_PRIVATE_KEY
+      - --bundle=${signature}
+      - '${artifact}'
+      - --yes
+    output: true
+
+nightly:
+  version_template: '{{ .Env.NEXT_IMAGE_VERSION }}'
+
+dockers_v2:
+  - id: apns-relay-image
+    ids:
+      - apns-relay
+    dockerfile: docker/Dockerfile-static
+    images:
+      - 'ghcr.io/getarcaneapp/apns-relay'
+    tags:
+      - '{{ if index .Env "BUILD_NEXT" }}next{{ end }}'
+      - 'v{{ .Version }}'
+      - '{{ if not (index .Env "BUILD_NEXT") }}v{{ .Major }}.{{ .Minor }}{{ end }}'
+      - '{{ if not (index .Env "BUILD_NEXT") }}v{{ .Major }}{{ end }}'
+      - '{{ if not (index .Env "BUILD_NEXT") }}latest{{ end }}'
+    platforms:
+      - linux/amd64
+      - linux/arm64
+      - linux/arm/v7
+      - linux/riscv64
+    labels:
+      'org.opencontainers.image.authors': 'Arcane Organization'
+      'org.opencontainers.image.url': 'https://github.com/getarcaneapp/apns-relay'
+      'org.opencontainers.image.documentation': 'https://github.com/getarcaneapp/apns-relay/blob/main/README.md'
+      'org.opencontainers.image.source': 'https://github.com/getarcaneapp/apns-relay'
+      'org.opencontainers.image.version': 'v{{.Version}}'
+      'org.opencontainers.image.revision': '{{.FullCommit}}'
+      'org.opencontainers.image.licenses': 'BSD-3-Clause'
+      'org.opencontainers.image.title': 'Arcane APNs Relay'
+      'org.opencontainers.image.description': 'Signed-envelope push relay for the Arcane mobile app'
+      'com.getarcaneapp.apns-relay': 'true'
+    sbom: true
+
+docker_signs:
+  - id: cosign-images
+    cmd: cosign
+    ids:
+      - apns-relay-image
+    stdin: '{{ .Env.COSIGN_PASSWORD }}'
+    args:
+      - sign
+      - --key=env://COSIGN_PRIVATE_KEY
+      - '${artifact}@${digest}'
+      - --yes
+    output: true
+
+changelog:
+  disable: '{{ if isEnvSet "SKIP_CHANGELOG" }}true{{ end }}'
+  use: github
+  filters:
+    include:
+      - '^feat'
+      - '^fix'
+      - '^perf'
+      - '^docs'
+      - '^refactor'
+      - '^test'
+      - '^build'
+      - '^ci'
+      - '^revert'
+      - '^chore\(deps\)'
+
+release:
+  github:
+    owner: getarcaneapp
+    name: apns-relay
+  disable: '{{ if index .Env "SKIP_RELEASE" }}true{{ end }}'
+  draft: true
+  replace_existing_draft: false
+  use_existing_draft: true
+  replace_existing_artifacts: true
+  prerelease: auto
+  make_latest: true
+  mode: replace
+  name_template: '{{.Tag}}'
