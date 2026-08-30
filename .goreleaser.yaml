@@ -48,20 +48,6 @@ archives:
       - binary
     name_template: '{{ .Binary }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}'
 
-signs:
-  - id: cosign-checksums
-    cmd: cosign
-    artifacts: checksum
-    signature: '${artifact}.sigstore.json'
-    stdin: '{{ .Env.COSIGN_PASSWORD }}'
-    args:
-      - sign-blob
-      - --key=env://COSIGN_PRIVATE_KEY
-      - --bundle=${signature}
-      - '${artifact}'
-      - --yes
-    output: true
-
 nightly:
   version_template: '{{ .Env.NEXT_IMAGE_VERSION }}'
 
@@ -95,19 +81,6 @@ dockers_v2:
       'org.opencontainers.image.description': 'Signed-envelope push relay for the Arcane mobile app'
       'com.getarcaneapp.apns-relay': 'true'
     sbom: true
-
-docker_signs:
-  - id: cosign-images
-    cmd: cosign
-    ids:
-      - apns-relay-image
-    stdin: '{{ .Env.COSIGN_PASSWORD }}'
-    args:
-      - sign
-      - --key=env://COSIGN_PRIVATE_KEY
-      - '${artifact}@${digest}'
-      - --yes
-    output: true
 
 changelog:
   disable: '{{ if isEnvSet "SKIP_CHANGELOG" }}true{{ end }}'
