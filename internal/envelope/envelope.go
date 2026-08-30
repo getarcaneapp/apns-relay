@@ -276,7 +276,7 @@ func BuildAPNSPayload(e *Envelope) ([]byte, error) {
 			Alert:             APNSAlert{Title: e.Title, Body: e.Body},
 			Sound:             "default",
 			ThreadID:          e.EnvironmentID,
-			InterruptionLevel: interruptionLevel(e.Severity),
+			InterruptionLevel: "active",
 		},
 		Arcane: ArcaneData{
 			Version:         Version,
@@ -299,14 +299,4 @@ func BuildAPNSPayload(e *Envelope) ([]byte, error) {
 		return nil, ErrPayloadLimit
 	}
 	return b, nil
-}
-
-func interruptionLevel(severity string) string {
-	switch severity {
-	case "info", "success":
-		return "passive"
-	default:
-		// MVP deliberately avoids time-sensitive/critical levels.
-		return "active"
-	}
 }
