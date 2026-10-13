@@ -10,25 +10,20 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 )
 
 // NewID returns a random, URL-safe identifier with the given prefix (e.g. "ch_").
 func NewID(prefix string) string {
 	var b [16]byte
-	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
-		panic(fmt.Sprintf("crypto/rand unavailable: %v", err))
-	}
+	_, _ = rand.Read(b[:])
 	return prefix + hex.EncodeToString(b[:])
 }
 
 // NewSecret returns a random 32-byte secret encoded as base64url (no padding).
 func NewSecret() string {
 	var b [32]byte
-	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
-		panic(fmt.Sprintf("crypto/rand unavailable: %v", err))
-	}
+	_, _ = rand.Read(b[:])
 	return base64.RawURLEncoding.EncodeToString(b[:])
 }
 

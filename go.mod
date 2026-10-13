@@ -3,6 +3,7 @@ module github.com/getarcaneapp/apns-relay
 go 1.27
 
 require (
+	go.getarcane.app/kit v0.4.0
 	go.yaml.in/yaml/v4 v4.0.0-rc.6
 	modernc.org/sqlite v1.57.0
 )

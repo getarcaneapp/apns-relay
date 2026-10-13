@@ -52,15 +52,15 @@ func TestPairingTokenRoundTrip(t *testing.T) {
 			if got != claims {
 				t.Fatalf("claims mismatch: %+v", got)
 			}
-			if err := VerifyPairingToken(kp.pub, got, payload, sig, now); err != nil {
+			if err = VerifyPairingToken(kp.pub, got, payload, sig, now); err != nil {
 				t.Fatal(err)
 			}
-			if err := VerifyPairingToken(kp.pub, got, payload, sig, now.Add(6*time.Minute)); !errors.Is(err, ErrTokenExpired) {
+			if err = VerifyPairingToken(kp.pub, got, payload, sig, now.Add(6*time.Minute)); !errors.Is(err, ErrTokenExpired) {
 				t.Fatalf("expected expired, got %v", err)
 			}
 			// Tamper with the payload byte.
 			payload[0] ^= 1
-			if err := VerifyPairingToken(kp.pub, got, payload, sig, now); !errors.Is(err, ErrBadSignature) {
+			if err = VerifyPairingToken(kp.pub, got, payload, sig, now); !errors.Is(err, ErrBadSignature) {
 				t.Fatalf("expected bad signature, got %v", err)
 			}
 		})
@@ -88,7 +88,7 @@ func TestPairingTokenRejectsLongLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyPairingToken(kp.pub, claims, payload, sig, now); !errors.Is(err, ErrBadToken) {
+	if err = VerifyPairingToken(kp.pub, claims, payload, sig, now); !errors.Is(err, ErrBadToken) {
 		t.Fatalf("expected bad token, got %v", err)
 	}
 }

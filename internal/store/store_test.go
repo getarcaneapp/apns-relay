@@ -1,7 +1,6 @@
 package store
 
 import (
-	"context"
 	"errors"
 	"testing"
 	"time"
@@ -19,7 +18,7 @@ func open(t *testing.T) *Store {
 
 func TestChannelLifecycle(t *testing.T) {
 	s := open(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	pk := []byte("pubkey-32-bytes-................")
 	ch, created, err := s.CreateChannel(ctx, "ch_a", "ed25519", pk)
 	if err != nil || !created || ch.ID != "ch_a" {
@@ -29,7 +28,7 @@ func TestChannelLifecycle(t *testing.T) {
 	if err != nil || created || again.ID != "ch_a" {
 		t.Fatalf("idempotent create: %v %v %+v", err, created, again)
 	}
-	if err := s.RevokeChannel(ctx, "ch_a"); err != nil {
+	if err = s.RevokeChannel(ctx, "ch_a"); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetChannel(ctx, "ch_a")
@@ -40,14 +39,14 @@ func TestChannelLifecycle(t *testing.T) {
 	if err != nil || !created || fresh.ID != "ch_c" {
 		t.Fatalf("re-register after revoke: %v %v %+v", err, created, fresh)
 	}
-	if err := s.RevokeChannel(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+	if err = s.RevokeChannel(ctx, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected not found, got %v", err)
 	}
 }
 
 func TestPairingAndDeliveries(t *testing.T) {
 	s := open(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	if _, _, err := s.CreateChannel(ctx, "ch_a", "ed25519", []byte("k")); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +59,7 @@ func TestPairingAndDeliveries(t *testing.T) {
 	if err != nil || b.RecipientID != "rcp_1" {
 		t.Fatalf("pair: %v %+v", err, b)
 	}
-	if _, err := s.Pair(ctx, "rcp_2", "ins_1", "ch_a", "user-1", "n1", exp); !errors.Is(err, ErrConflict) {
+	if _, err = s.Pair(ctx, "rcp_2", "ins_1", "ch_a", "user-1", "n1", exp); !errors.Is(err, ErrConflict) {
 		t.Fatalf("nonce replay should conflict, got %v", err)
 	}
 	b2, err := s.Pair(ctx, "rcp_2", "ins_1", "ch_a", "user-2", "n2", exp)
@@ -72,10 +71,10 @@ func TestPairingAndDeliveries(t *testing.T) {
 	if err != nil || len(recips) != 1 || recips[0].InstallationID != "ins_1" {
 		t.Fatalf("resolve: %v %+v", err, recips)
 	}
-	if err := s.EnqueueEvent(ctx, "ch_a", "evt-1", "evt-1", []NewDelivery{{RecipientID: "rcp_1", InstallationID: "ins_1", Payload: []byte("{}")}}); err != nil {
+	if err = s.EnqueueEvent(ctx, "ch_a", "evt-1", "evt-1", []NewDelivery{{RecipientID: "rcp_1", InstallationID: "ins_1", Payload: []byte("{}")}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.EnqueueEvent(ctx, "ch_a", "evt-1", "evt-1", nil); !errors.Is(err, ErrConflict) {
+	if err = s.EnqueueEvent(ctx, "ch_a", "evt-1", "evt-1", nil); !errors.Is(err, ErrConflict) {
 		t.Fatalf("duplicate event should conflict, got %v", err)
 	}
 	claimed, err := s.ClaimDue(ctx, 10, time.Minute)
@@ -85,14 +84,14 @@ func TestPairingAndDeliveries(t *testing.T) {
 	if again, _ := s.ClaimDue(ctx, 10, time.Minute); len(again) != 0 {
 		t.Fatalf("locked delivery should not be reclaimed, got %d", len(again))
 	}
-	if err := s.MarkRetry(ctx, claimed[0].ID, time.Now().Add(-time.Second), "503"); err != nil {
+	if err = s.MarkRetry(ctx, claimed[0].ID, time.Now().Add(-time.Second), "503"); err != nil {
 		t.Fatal(err)
 	}
 	claimed, err = s.ClaimDue(ctx, 10, time.Minute)
 	if err != nil || len(claimed) != 1 || claimed[0].Attempts != 1 {
 		t.Fatalf("reclaim after retry: %v %+v", err, claimed)
 	}
-	if err := s.MarkSent(ctx, claimed[0].ID); err != nil {
+	if err = s.MarkSent(ctx, claimed[0].ID); err != nil {
 		t.Fatal(err)
 	}
 	d, err := s.GetDelivery(ctx, claimed[0].ID)
@@ -101,10 +100,10 @@ func TestPairingAndDeliveries(t *testing.T) {
 	}
 
 	// Deleting the installation drops pending deliveries and bindings.
-	if err := s.EnqueueEvent(ctx, "ch_a", "evt-2", "evt-2", []NewDelivery{{RecipientID: "rcp_1", InstallationID: "ins_1", Payload: []byte("{}")}}); err != nil {
+	if err = s.EnqueueEvent(ctx, "ch_a", "evt-2", "evt-2", []NewDelivery{{RecipientID: "rcp_1", InstallationID: "ins_1", Payload: []byte("{}")}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DeleteInstallation(ctx, "ins_1"); err != nil {
+	if err = s.DeleteInstallation(ctx, "ins_1"); err != nil {
 		t.Fatal(err)
 	}
 	ds, _ := s.ListDeliveriesByEvent(ctx, "ch_a", "evt-2")
@@ -114,14 +113,14 @@ func TestPairingAndDeliveries(t *testing.T) {
 	if r, _ := s.ResolveRecipients(ctx, "ch_a", []string{"rcp_1"}); len(r) != 0 {
 		t.Fatal("binding should be gone after installation delete")
 	}
-	if _, err := s.GetInstallation(ctx, "ins_1"); !errors.Is(err, ErrNotFound) {
+	if _, err = s.GetInstallation(ctx, "ins_1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected not found, got %v", err)
 	}
 }
 
 func TestPrune(t *testing.T) {
 	s := open(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	base := time.Now()
 	s.now = func() time.Time { return base.Add(-48 * time.Hour) }
 	if _, _, err := s.CreateChannel(ctx, "ch_a", "ed25519", []byte("k")); err != nil {
@@ -138,7 +137,7 @@ func TestPrune(t *testing.T) {
 	if err := s.Prune(ctx, 24*time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if ds, _ := s.ListDeliveriesByEvent(ctx, "ch_a", "old"); len(ds) != 0 {
+	if ds, _ = s.ListDeliveriesByEvent(ctx, "ch_a", "old"); len(ds) != 0 {
 		t.Fatalf("expected pruned deliveries, got %d", len(ds))
 	}
 	if err := s.EnqueueEvent(ctx, "ch_a", "old", "old", nil); err != nil {

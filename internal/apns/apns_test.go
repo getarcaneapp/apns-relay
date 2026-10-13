@@ -1,7 +1,6 @@
 package apns
 
 import (
-	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -18,7 +17,7 @@ import (
 func TestProviderTokenIsValidES256AndCached(t *testing.T) {
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	now := time.Unix(1_700_000_000, 0)
-	p := newTokenProvider("KID", "TEAM", key, func() time.Time { return now })
+	p := &tokenProvider{keyID: "KID", teamID: "TEAM", key: key, now: func() time.Time { return now }}
 	tok, err := p.Token()
 	if err != nil {
 		t.Fatal(err)
@@ -90,9 +89,9 @@ func TestClientSendClassification(t *testing.T) {
 	}
 	for _, tc := range cases {
 		status, reason = tc.status, tc.reason
-		res, err := c.Send(context.Background(), Notification{DeviceToken: "abcd", Environment: EnvironmentSandbox, Payload: []byte(`{}`), CollapseID: "evt", Expiration: time.Now().Add(time.Hour)})
-		if err != nil {
-			t.Fatalf("%d %s: %v", tc.status, tc.reason, err)
+		res, sendErr := c.Send(t.Context(), Notification{DeviceToken: "abcd", Environment: EnvironmentSandbox, Payload: []byte(`{}`), CollapseID: "evt", Expiration: time.Now().Add(time.Hour)})
+		if sendErr != nil {
+			t.Fatalf("%d %s: %v", tc.status, tc.reason, sendErr)
 		}
 		if res.Outcome != tc.want || res.StatusCode != tc.status || res.Reason != tc.reason {
 			t.Errorf("%d %s: got %+v", tc.status, tc.reason, res)

@@ -19,7 +19,7 @@ func TestSealRoundTrip(t *testing.T) {
 	if err != nil || string(got) != "token" {
 		t.Fatalf("open: %v %q", err, got)
 	}
-	if _, err := s.Open(sealed, []byte("ins_2")); err == nil {
+	if _, err = s.Open(sealed, []byte("ins_2")); err == nil {
 		t.Fatal("expected AAD mismatch to fail")
 	}
 }

@@ -35,19 +35,14 @@ test:
     go test -race -coverprofile=coverage.txt -covermode=atomic ./...
 
 [group('quality')]
-format: _build-golangci-lint
-    ./.bin/golangci-lint-custom fmt -c .github/.golangci.yml ./...
+format:
+    golangci-lint fmt -c .golangci.yml ./...
     go mod tidy
-
-# Build golangci-lint with the custom linters enabled by the shared Arcane config
-[group('quality')]
-_build-golangci-lint:
-    golangci-lint custom
 
 # Lint with the same golangci-lint config as Arcane
 [group('quality')]
-lint: _build-golangci-lint
-    ./.bin/golangci-lint-custom run -c .github/.golangci.yml ./...
+lint:
+    golangci-lint run -c .golangci.yml ./...
 
 [group('quality')]
 deadcode:

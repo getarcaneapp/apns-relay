@@ -80,10 +80,10 @@ func newHarness(t *testing.T) *harness {
 	fake.status.Store(200)
 	fake.reason.Store("")
 	h := &harness{t: t, store: st, apns: fake, now: time.Now()}
-	h.worker = worker.New(worker.Options{Store: st, Sender: fake, Sealer: sealer, Metrics: reg, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), MaxAttempts: 3})
+	h.worker = worker.New(worker.Options{Store: st, Sender: fake, Sealer: sealer, Metrics: reg, Logger: slog.New(slog.DiscardHandler), MaxAttempts: 3})
 	s := server.New(server.Options{
 		Config: cfg, Store: st, Sealer: sealer, Metrics: reg,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger: slog.New(slog.DiscardHandler),
 		Wake:   func() { h.woken.Add(1) },
 		Now:    func() time.Time { return h.now },
 	})
@@ -107,7 +107,7 @@ func (h *harness) do(method, path string, body any, headers map[string]string) r
 	default:
 		raw, _ = json.Marshal(b)
 	}
-	req, _ := http.NewRequestWithContext(context.Background(), method, h.srv.URL+path, bytes.NewReader(raw))
+	req, _ := http.NewRequestWithContext(h.t.Context(), method, h.srv.URL+path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -187,7 +187,8 @@ func (h *harness) enroll(token string) device {
 
 func (h *harness) pair(m *manager, d *device) {
 	h.t.Helper()
-	tok, err := signing.MintPairingToken(m.signer, signing.PairingClaims{ChannelID: m.channelID, Subject: "user-1", IssuedAt: h.now.Unix(), ExpiresAt: h.now.Add(5 * time.Minute).Unix(), Nonce: secrets.NewID("n_")})
+	claims := signing.PairingClaims{ChannelID: m.channelID, Subject: "user-1", IssuedAt: h.now.Unix(), ExpiresAt: h.now.Add(5 * time.Minute).Unix(), Nonce: secrets.NewID("n_")}
+	tok, err := signing.MintPairingToken(m.signer, claims)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -212,82 +213,84 @@ func (h *harness) envelope(m *manager, eventID string, recipients ...string) map
 
 func TestFullFlow(t *testing.T) {
 	for _, alg := range []signing.Algorithm{signing.AlgEd25519, signing.AlgMLDSA87} {
-		t.Run(string(alg), func(t *testing.T) {
-			h := newHarness(t)
-			m := newManager(t, alg)
-			h.register(m)
+		t.Run(string(alg), func(t *testing.T) { testFullFlow(t, alg) })
+	}
+}
 
-			// Registration is idempotent for the same key.
-			again := h.do("POST", "/v1/channels", map[string]string{"algorithm": string(alg), "publicKey": m.pubB64}, nil)
-			if again.code != http.StatusOK || again.body["channelId"] != m.channelID {
-				t.Fatalf("re-register: %d %v", again.code, again.body)
-			}
+func testFullFlow(t *testing.T, alg signing.Algorithm) {
+	h := newHarness(t)
+	m := newManager(t, alg)
+	h.register(m)
 
-			d := h.enroll(strings.Repeat("ab", 32))
-			h.pair(m, &d)
+	// Registration is idempotent for the same key.
+	again := h.do("POST", "/v1/channels", map[string]string{"algorithm": string(alg), "publicKey": m.pubB64}, nil)
+	if again.code != http.StatusOK || again.body["channelId"] != m.channelID {
+		t.Fatalf("re-register: %d %v", again.code, again.body)
+	}
 
-			raw, hdr := m.signed(t, h.envelope(m, "evt-1", d.recipient, "rcp_missing"))
-			r := h.do("POST", "/v1/events", raw, hdr)
-			if r.code != http.StatusAccepted || r.body["queued"].(float64) != 1 {
-				t.Fatalf("events: %d %v", r.code, r.body)
-			}
-			if unknown := r.body["unknownRecipientIds"].([]any); len(unknown) != 1 || unknown[0] != "rcp_missing" {
-				t.Fatalf("unknown recipients: %v", r.body)
-			}
-			if h.woken.Load() != 1 {
-				t.Fatal("worker should be woken")
-			}
-			// Duplicate event id is a no-op.
-			r = h.do("POST", "/v1/events", raw, hdr)
-			if r.code != http.StatusOK || r.body["duplicate"] != true {
-				t.Fatalf("duplicate: %d %v", r.code, r.body)
-			}
+	d := h.enroll(strings.Repeat("ab", 32))
+	h.pair(m, &d)
 
-			if _, err := h.worker.Drain(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			if h.apns.sent.Load() != 1 {
-				t.Fatalf("expected 1 send, got %d", h.apns.sent.Load())
-			}
-			n := h.apns.last.Load().(apns.Notification)
-			if n.DeviceToken != strings.Repeat("ab", 32) || n.Environment != apns.EnvironmentSandbox ||
-				!strings.HasPrefix(n.CollapseID, "d-") || len(n.CollapseID) > 64 {
-				t.Fatalf("unexpected notification: %+v", n)
-			}
-			if strings.Contains(string(n.Payload), d.recipient) {
-				t.Fatal("payload leaked recipient id")
-			}
-			ds, _ := h.store.ListDeliveriesByEvent(context.Background(), m.channelID, "evt-1")
-			if len(ds) != 1 || ds[0].Status != store.DeliverySent || ds[0].Payload != nil {
-				t.Fatalf("delivery state: %+v", ds)
-			}
+	raw, hdr := m.signed(t, h.envelope(m, "evt-1", d.recipient, "rcp_missing"))
+	r := h.do("POST", "/v1/events", raw, hdr)
+	if r.code != http.StatusAccepted || r.body["queued"].(float64) != 1 {
+		t.Fatalf("events: %d %v", r.code, r.body)
+	}
+	if unknown := r.body["unknownRecipientIds"].([]any); len(unknown) != 1 || unknown[0] != "rcp_missing" {
+		t.Fatalf("unknown recipients: %v", r.body)
+	}
+	if h.woken.Load() != 1 {
+		t.Fatal("worker should be woken")
+	}
+	// Duplicate event id is a no-op.
+	r = h.do("POST", "/v1/events", raw, hdr)
+	if r.code != http.StatusOK || r.body["duplicate"] != true {
+		t.Fatalf("duplicate: %d %v", r.code, r.body)
+	}
 
-			// Test push to one recipient.
-			raw, hdr = m.signed(t, map[string]any{"channelId": m.channelID, "issuedAt": h.now.UTC(), "nonce": "abc123", "recipientId": d.recipient})
-			if r := h.do("POST", "/v1/test", raw, hdr); r.code != http.StatusAccepted {
-				t.Fatalf("test: %d %v", r.code, r.body)
-			}
+	if _, err := h.worker.Drain(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if h.apns.sent.Load() != 1 {
+		t.Fatalf("expected 1 send, got %d", h.apns.sent.Load())
+	}
+	n := h.apns.last.Load().(apns.Notification)
+	if n.DeviceToken != strings.Repeat("ab", 32) || n.Environment != apns.EnvironmentSandbox ||
+		!strings.HasPrefix(n.CollapseID, "d-") || len(n.CollapseID) > 64 {
+		t.Fatalf("unexpected notification: %+v", n)
+	}
+	if strings.Contains(string(n.Payload), d.recipient) {
+		t.Fatal("payload leaked recipient id")
+	}
+	ds, _ := h.store.ListDeliveriesByEvent(t.Context(), m.channelID, "evt-1")
+	if len(ds) != 1 || ds[0].Status != store.DeliverySent || ds[0].Payload != nil {
+		t.Fatalf("delivery state: %+v", ds)
+	}
 
-			// Unpair, then events for that recipient are unknown.
-			if r := h.do("POST", "/v1/unpair", map[string]string{"recipientId": d.recipient}, d.auth()); r.code != http.StatusNoContent {
-				t.Fatalf("unpair: %d %v", r.code, r.body)
-			}
-			raw, hdr = m.signed(t, h.envelope(m, "evt-2", d.recipient))
-			r = h.do("POST", "/v1/events", raw, hdr)
-			if r.code != http.StatusAccepted || r.body["queued"].(float64) != 0 || h.woken.Load() != 2 {
-				t.Fatalf("after unpair: %d %v woken=%d", r.code, r.body, h.woken.Load())
-			}
+	// Test push to one recipient.
+	raw, hdr = m.signed(t, map[string]any{"channelId": m.channelID, "issuedAt": h.now.UTC(), "nonce": "abc123", "recipientId": d.recipient})
+	if r = h.do("POST", "/v1/test", raw, hdr); r.code != http.StatusAccepted {
+		t.Fatalf("test: %d %v", r.code, r.body)
+	}
 
-			// Revoke channel (signed), then everything is 410.
-			raw, hdr = m.signed(t, map[string]any{"channelId": m.channelID, "issuedAt": h.now.UTC(), "nonce": "r1"})
-			if r := h.do("DELETE", "/v1/channels/"+m.channelID, raw, hdr); r.code != http.StatusNoContent {
-				t.Fatalf("revoke: %d %v", r.code, r.body)
-			}
-			raw, hdr = m.signed(t, h.envelope(m, "evt-3", d.recipient))
-			if r := h.do("POST", "/v1/events", raw, hdr); r.code != http.StatusGone {
-				t.Fatalf("post-revoke: %d %v", r.code, r.body)
-			}
-		})
+	// Unpair, then events for that recipient are unknown.
+	if r = h.do("POST", "/v1/unpair", map[string]string{"recipientId": d.recipient}, d.auth()); r.code != http.StatusNoContent {
+		t.Fatalf("unpair: %d %v", r.code, r.body)
+	}
+	raw, hdr = m.signed(t, h.envelope(m, "evt-2", d.recipient))
+	r = h.do("POST", "/v1/events", raw, hdr)
+	if r.code != http.StatusAccepted || r.body["queued"].(float64) != 0 || h.woken.Load() != 2 {
+		t.Fatalf("after unpair: %d %v woken=%d", r.code, r.body, h.woken.Load())
+	}
+
+	// Revoke channel (signed), then everything is 410.
+	raw, hdr = m.signed(t, map[string]any{"channelId": m.channelID, "issuedAt": h.now.UTC(), "nonce": "r1"})
+	if r = h.do("DELETE", "/v1/channels/"+m.channelID, raw, hdr); r.code != http.StatusNoContent {
+		t.Fatalf("revoke: %d %v", r.code, r.body)
+	}
+	raw, hdr = m.signed(t, h.envelope(m, "evt-3", d.recipient))
+	if r = h.do("POST", "/v1/events", raw, hdr); r.code != http.StatusGone {
+		t.Fatalf("post-revoke: %d %v", r.code, r.body)
 	}
 }
 
@@ -371,14 +374,14 @@ func TestWorkerInvalidTokenRemovesInstallation(t *testing.T) {
 
 	h.apns.status.Store(410)
 	h.apns.reason.Store("Unregistered")
-	if _, err := h.worker.Drain(context.Background()); err != nil {
+	if _, err := h.worker.Drain(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.GetInstallation(context.Background(), d.id); err == nil {
+	if _, err := h.store.GetInstallation(t.Context(), d.id); err == nil {
 		t.Fatal("installation should have been removed")
 	}
 	for _, ev := range []string{"evt-1", "evt-2"} {
-		ds, _ := h.store.ListDeliveriesByEvent(context.Background(), m.channelID, ev)
+		ds, _ := h.store.ListDeliveriesByEvent(t.Context(), m.channelID, ev)
 		if len(ds) != 1 || ds[0].Status != store.DeliveryDropped {
 			t.Fatalf("%s: %+v", ev, ds)
 		}
@@ -399,23 +402,23 @@ func TestWorkerRetriesThenFails(t *testing.T) {
 
 	h.apns.status.Store(503)
 	h.apns.reason.Store("ServiceUnavailable")
-	if _, err := h.worker.Drain(context.Background()); err != nil {
+	if _, err := h.worker.Drain(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	ds, _ := h.store.ListDeliveriesByEvent(context.Background(), m.channelID, "evt-1")
+	ds, _ := h.store.ListDeliveriesByEvent(t.Context(), m.channelID, "evt-1")
 	if ds[0].Status != store.DeliveryPending || ds[0].Attempts != 1 || !ds[0].NextAttemptAt.After(time.Now()) {
 		t.Fatalf("expected retry scheduled: %+v", ds[0])
 	}
 	// Force the delivery due again and exhaust attempts (MaxAttempts=3).
 	for i := 0; i < 2; i++ {
-		if err := h.store.MarkRetry(context.Background(), ds[0].ID, time.Now().Add(-time.Second), "force"); err != nil {
+		if err := h.store.MarkRetry(t.Context(), ds[0].ID, time.Now().Add(-time.Second), "force"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := h.worker.Drain(context.Background()); err != nil {
+		if _, err := h.worker.Drain(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ds, _ = h.store.ListDeliveriesByEvent(context.Background(), m.channelID, "evt-1")
+	ds, _ = h.store.ListDeliveriesByEvent(t.Context(), m.channelID, "evt-1")
 	if ds[0].Status != store.DeliveryFailed {
 		t.Fatalf("expected failed after max attempts: %+v", ds[0])
 	}
@@ -433,7 +436,7 @@ func TestTokenRotation(t *testing.T) {
 	}
 	raw, hdr := m.signed(t, h.envelope(m, "evt-1", d.recipient))
 	h.do("POST", "/v1/events", raw, hdr)
-	if _, err := h.worker.Drain(context.Background()); err != nil {
+	if _, err := h.worker.Drain(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	n := h.apns.last.Load().(apns.Notification)
@@ -447,7 +450,7 @@ func TestHealthAndMetrics(t *testing.T) {
 	if r := h.do("GET", "/healthz", nil, nil); r.code != http.StatusOK || r.body["status"] != "ok" {
 		t.Fatalf("health: %d %v", r.code, r.body)
 	}
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, h.srv.URL+"/metrics", nil)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, h.srv.URL+"/metrics", http.NoBody)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

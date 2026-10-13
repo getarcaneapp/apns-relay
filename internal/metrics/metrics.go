@@ -4,8 +4,10 @@ package metrics
 import (
 	"fmt"
 	"io"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -82,41 +84,22 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 			return n, err
 		}
 	}
-	if err := write("# HELP relay_queue_latency_milliseconds Time from enqueue to first send attempt.\n# TYPE relay_queue_latency_milliseconds summary\nrelay_queue_latency_milliseconds_sum %d\nrelay_queue_latency_milliseconds_count %d\n",
+	if err := write("# HELP relay_queue_latency_milliseconds Time from enqueue to first send attempt.\n# TYPE relay_queue_latency_milliseconds summary\n"+
+		"relay_queue_latency_milliseconds_sum %d\nrelay_queue_latency_milliseconds_count %d\n",
 		r.QueueLatencySum.Load(), r.QueueLatencyCount.Load()); err != nil {
 		return n, err
 	}
 	r.mu.Lock()
-	keys := make([]string, 0, len(r.apnsStatus))
-	for k := range r.apnsStatus {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	values := make(map[string]int64, len(keys))
-	for _, k := range keys {
-		values[k] = r.apnsStatus[k].Load()
-	}
+	statuses := maps.Clone(r.apnsStatus)
 	r.mu.Unlock()
 	if err := write("# HELP relay_apns_responses_total APNs responses by status and reason.\n# TYPE relay_apns_responses_total counter\n"); err != nil {
 		return n, err
 	}
-	for _, k := range keys {
-		var status, reason string
-		if i := indexOf(k, '|'); i >= 0 {
-			status, reason = k[:i], k[i+1:]
-		}
-		if err := write("relay_apns_responses_total{status=%q,reason=%q} %d\n", status, reason, values[k]); err != nil {
+	for _, k := range slices.Sorted(maps.Keys(statuses)) {
+		status, reason, _ := strings.Cut(k, "|")
+		if err := write("relay_apns_responses_total{status=%q,reason=%q} %d\n", status, reason, statuses[k].Load()); err != nil {
 			return n, err
 		}
 	}
 	return n, nil
-}
-
-func indexOf(s string, c byte) int {
-	for i := range len(s) {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
 }

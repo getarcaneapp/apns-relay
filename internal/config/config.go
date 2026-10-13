@@ -5,6 +5,7 @@ package config
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/ecdsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	kit "go.getarcane.app/kit/pkg"
 	"go.yaml.in/yaml/v4"
 )
 
@@ -152,13 +154,7 @@ func ParseFile(b []byte) (*File, error) {
 // RELAY_ prefix (APNS_ prefix for the apns block).
 func resolve(f File, getenv func(string) string, readFile func(string) ([]byte, error)) (*Config, error) {
 	str := func(env, fileVal, def string) string {
-		if v := strings.TrimSpace(getenv(env)); v != "" {
-			return v
-		}
-		if strings.TrimSpace(fileVal) != "" {
-			return strings.TrimSpace(fileVal)
-		}
-		return def
+		return cmp.Or(strings.TrimSpace(getenv(env)), strings.TrimSpace(fileVal), def)
 	}
 	cfg := &Config{
 		ListenAddr:     str("RELAY_LISTEN_ADDR", f.Listen, DefaultListenAddr),
@@ -185,176 +181,124 @@ func resolve(f File, getenv func(string) string, readFile func(string) ([]byte, 
 		},
 	}
 
-	r := &resolver{cfg: cfg, file: f, getenv: getenv, readFile: readFile, str: str}
-	r.encryptionKey()
-	r.durations()
-	r.integers()
-	r.flagsAndLogging()
-	r.apns()
-	if len(r.errs) > 0 {
-		return nil, errors.Join(r.errs...)
+	var errs []error
+	failf := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
+
+	if keyRaw, err := secretValue(getenv, readFile, "RELAY_ENCRYPTION_KEY", "RELAY_ENCRYPTION_KEY_FILE", f.EncryptionKey, f.EncryptionKeyFile); err != nil {
+		failf("encryption key file: %w", err)
+	} else if cfg.EncryptionKey, err = decodeKey(keyRaw); err != nil {
+		failf("encryption_key / RELAY_ENCRYPTION_KEY: %w", err)
 	}
-	return cfg, nil
-}
 
-type resolver struct {
-	cfg      *Config
-	file     File
-	getenv   func(string) string
-	readFile func(string) ([]byte, error)
-	str      func(env, fileVal, def string) string
-	errs     []error
-}
-
-func (r *resolver) failf(format string, args ...any) {
-	r.errs = append(r.errs, fmt.Errorf(format, args...))
-}
-
-// encryptionKey resolves env value > env file > yaml value > yaml file.
-func (r *resolver) encryptionKey() {
-	keyRaw := r.str("RELAY_ENCRYPTION_KEY", r.file.EncryptionKey, "")
-	if keyRaw == "" {
-		if keyFile := r.str("RELAY_ENCRYPTION_KEY_FILE", r.file.EncryptionKeyFile, ""); keyFile != "" {
-			b, err := r.readFile(keyFile)
-			if err != nil {
-				r.failf("encryption key file: %w", err)
-			}
-			keyRaw = string(b)
-		}
-	}
-	key, err := decodeKey(keyRaw)
-	if err != nil {
-		r.failf("encryption_key / RELAY_ENCRYPTION_KEY: %w", err)
-	}
-	r.cfg.EncryptionKey = key
-}
-
-func (r *resolver) durations() {
 	for _, it := range []struct {
 		env, file, name string
 		dst             *time.Duration
 	}{
-		{"RELAY_MAX_ENVELOPE_AGE", r.file.MaxEnvelopeAge, "max_envelope_age", &r.cfg.MaxEnvelopeAge},
-		{"RELAY_RETENTION", r.file.Retention, "retention", &r.cfg.Retention},
+		{"RELAY_MAX_ENVELOPE_AGE", f.MaxEnvelopeAge, "max_envelope_age", &cfg.MaxEnvelopeAge},
+		{"RELAY_RETENTION", f.Retention, "retention", &cfg.Retention},
 	} {
-		v := r.str(it.env, it.file, "")
+		v := str(it.env, it.file, "")
 		if v == "" {
 			continue
 		}
 		d, err := time.ParseDuration(v)
 		if err != nil || d <= 0 {
-			r.failf("%s: invalid duration %q", it.name, v)
+			failf("%s: invalid duration %q", it.name, v)
 			continue
 		}
 		*it.dst = d
 	}
-}
 
-func (r *resolver) integers() {
-	if v, ok := intValue(r.getenv("RELAY_MAX_BODY_BYTES"), r.file.MaxBodyBytes); ok {
-		if v < 1024 {
-			r.failf("max_body_bytes: must be at least 1024")
-		} else {
-			r.cfg.MaxBodyBytes = v
-		}
-	} else if r.getenv("RELAY_MAX_BODY_BYTES") != "" {
-		r.failf("RELAY_MAX_BODY_BYTES: invalid value")
-	}
-	for _, it := range []struct {
-		env  string
-		file *int
-		dst  *int
-		min  int
-		max  int
-	}{
-		{"RELAY_WORKERS", r.file.Workers, &r.cfg.Workers, 1, 256},
-		{"RELAY_MAX_ATTEMPTS", r.file.MaxAttempts, &r.cfg.MaxAttempts, 1, 50},
-		{"RELAY_RATE_LIMIT_IP_PER_MINUTE", r.file.RateLimits.IPPerMinute, &r.cfg.RateLimits.IPPerMinute, 1, 1 << 30},
-		{"RELAY_RATE_LIMIT_CHANNEL_PER_MINUTE", r.file.RateLimits.ChannelPerMinute, &r.cfg.RateLimits.ChannelPerMinute, 1, 1 << 30},
-		{"RELAY_RATE_LIMIT_INSTALLATION_PER_MINUTE", r.file.RateLimits.InstallationPerMinute, &r.cfg.RateLimits.InstallationPerMinute, 1, 1 << 30},
-	} {
-		v, ok := intValue(r.getenv(it.env), ptrInt64FromInt(it.file))
+	errs = append(errs,
+		intSetting(getenv, "RELAY_MAX_BODY_BYTES", f.MaxBodyBytes, &cfg.MaxBodyBytes, 1024, 1<<30),
+		intSetting(getenv, "RELAY_WORKERS", f.Workers, &cfg.Workers, 1, 256),
+		intSetting(getenv, "RELAY_MAX_ATTEMPTS", f.MaxAttempts, &cfg.MaxAttempts, 1, 50),
+		intSetting(getenv, "RELAY_RATE_LIMIT_IP_PER_MINUTE", f.RateLimits.IPPerMinute, &cfg.RateLimits.IPPerMinute, 1, 1<<30),
+		intSetting(getenv, "RELAY_RATE_LIMIT_CHANNEL_PER_MINUTE", f.RateLimits.ChannelPerMinute, &cfg.RateLimits.ChannelPerMinute, 1, 1<<30),
+		intSetting(getenv, "RELAY_RATE_LIMIT_INSTALLATION_PER_MINUTE", f.RateLimits.InstallationPerMinute, &cfg.RateLimits.InstallationPerMinute, 1, 1<<30),
+	)
+
+	cfg.TrustProxyHeaders = kit.FromPtr(f.TrustProxyHeaders)
+	if v := getenv("RELAY_TRUST_PROXY_HEADERS"); v != "" {
+		b, ok := kit.ParseBool(v)
 		if !ok {
-			if r.getenv(it.env) != "" {
-				r.failf("%s: invalid value", it.env)
-			}
-			continue
+			failf("RELAY_TRUST_PROXY_HEADERS: invalid value %q", v)
 		}
-		if v < int64(it.min) || v > int64(it.max) {
-			r.failf("%s: must be between %d and %d", it.env, it.min, it.max)
-			continue
-		}
-		*it.dst = int(v)
+		cfg.TrustProxyHeaders = b
 	}
-}
+	if v := str("RELAY_LOG_LEVEL", f.Log.Level, ""); v != "" {
+		if err := cfg.LogLevel.UnmarshalText([]byte(v)); err != nil {
+			failf("log.level: invalid value %q", v)
+		}
+	}
+	if cfg.LogFormat != "json" && cfg.LogFormat != "text" {
+		failf("log.format: must be json or text")
+	}
 
-func (r *resolver) flagsAndLogging() {
-	if v := r.getenv("RELAY_TRUST_PROXY_HEADERS"); v != "" {
-		b, err := strconv.ParseBool(v)
-		if err != nil {
-			r.failf("RELAY_TRUST_PROXY_HEADERS: invalid value %q", v)
-		}
-		r.cfg.TrustProxyHeaders = b
-	} else if r.file.TrustProxyHeaders != nil {
-		r.cfg.TrustProxyHeaders = *r.file.TrustProxyHeaders
-	}
-	if v := r.str("RELAY_LOG_LEVEL", r.file.Log.Level, ""); v != "" {
-		var lvl slog.Level
-		if err := lvl.UnmarshalText([]byte(v)); err != nil {
-			r.failf("log.level: invalid value %q", v)
-		}
-		r.cfg.LogLevel = lvl
-	}
-	if r.cfg.LogFormat != "json" && r.cfg.LogFormat != "text" {
-		r.failf("log.format: must be json or text")
-	}
-}
-
-func (r *resolver) apns() {
-	switch r.cfg.APNS.Mode {
+	switch cfg.APNS.Mode {
 	case APNSModeLive:
-		if r.cfg.APNS.KeyID == "" {
-			r.failf("apns.key_id / APNS_KEY_ID is required")
+		if cfg.APNS.KeyID == "" {
+			failf("apns.key_id / APNS_KEY_ID is required")
 		}
-		if r.cfg.APNS.TeamID == "" {
-			r.failf("apns.team_id / APNS_TEAM_ID is required")
+		if cfg.APNS.TeamID == "" {
+			failf("apns.team_id / APNS_TEAM_ID is required")
 		}
-		pk, err := loadAPNSKey(r.file, r.getenv, r.readFile)
-		if err != nil {
-			r.errs = append(r.errs, err)
+		keyPEM, err := secretValue(getenv, readFile, "APNS_KEY_P8", "APNS_KEY_FILE", f.APNS.Key, f.APNS.KeyFile)
+		switch {
+		case err != nil:
+			failf("apns.key_file / APNS_KEY_FILE: %w", err)
+		case keyPEM == "":
+			failf("apns.key / apns.key_file (or APNS_KEY_P8 / APNS_KEY_FILE) is required")
+		default:
+			cfg.APNS.PrivateKey, err = ParseP8([]byte(strings.ReplaceAll(keyPEM, `\n`, "\n")))
+			errs = append(errs, err)
 		}
-		r.cfg.APNS.PrivateKey = pk
 	case APNSModeLog:
 	default:
-		r.failf("apns.mode: must be %q or %q", APNSModeLive, APNSModeLog)
+		failf("apns.mode: must be %q or %q", APNSModeLive, APNSModeLog)
 	}
-	if r.cfg.APNS.Topic == "" {
-		r.failf("apns.topic must not be empty")
+	if cfg.APNS.Topic == "" {
+		failf("apns.topic must not be empty")
 	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
-func ptrInt64FromInt(p *int) *int64 {
-	if p == nil {
+// secretValue returns an inline value or the contents of a file path; the env pair overrides the YAML pair.
+func secretValue(getenv func(string) string, readFile func(string) ([]byte, error), env, envFile, yamlValue, yamlFile string) (string, error) {
+	value, file := strings.TrimSpace(getenv(env)), strings.TrimSpace(getenv(envFile))
+	if value == "" && file == "" {
+		value, file = strings.TrimSpace(yamlValue), strings.TrimSpace(yamlFile)
+	}
+	if value != "" || file == "" {
+		return value, nil
+	}
+	b, err := readFile(file)
+	return string(b), err
+}
+
+// intSetting applies the env value, or else the YAML value, to dst when it lies within [lo, hi].
+func intSetting[T int | int64](getenv func(string) string, env string, file, dst *T, lo, hi T) error {
+	var v int64
+	switch raw := strings.TrimSpace(getenv(env)); {
+	case raw != "":
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return fmt.Errorf("%s: invalid value", env)
+		}
+		v = n
+	case file != nil:
+		v = int64(*file)
+	default:
 		return nil
 	}
-	v := int64(*p)
-	return &v
-}
-
-// intValue returns env (parsed) if set, else the file value if set. ok=false when neither
-// is usable; callers distinguish "unset" from "invalid" by checking env themselves.
-func intValue(env string, file *int64) (int64, bool) {
-	if strings.TrimSpace(env) != "" {
-		n, err := strconv.ParseInt(strings.TrimSpace(env), 10, 64)
-		if err != nil {
-			return 0, false
-		}
-		return n, true
+	if v < int64(lo) || v > int64(hi) {
+		return fmt.Errorf("%s: must be between %d and %d", env, lo, hi)
 	}
-	if file != nil {
-		return *file, true
-	}
-	return 0, false
+	*dst = T(v)
+	return nil
 }
 
 // decodeKey accepts a 32-byte key encoded as hex or base64 (std or url, padded or not).
@@ -372,31 +316,6 @@ func decodeKey(raw string) ([]byte, error) {
 		}
 	}
 	return nil, errors.New("must decode to exactly 32 bytes (hex or base64)")
-}
-
-func loadAPNSKey(f File, getenv func(string) string, readFile func(string) ([]byte, error)) (*ecdsa.PrivateKey, error) {
-	var pemBytes []byte
-	switch {
-	case getenv("APNS_KEY_P8") != "":
-		pemBytes = []byte(strings.ReplaceAll(getenv("APNS_KEY_P8"), `\n`, "\n"))
-	case getenv("APNS_KEY_FILE") != "":
-		b, err := readFile(getenv("APNS_KEY_FILE"))
-		if err != nil {
-			return nil, fmt.Errorf("APNS_KEY_FILE: %w", err)
-		}
-		pemBytes = b
-	case strings.TrimSpace(f.APNS.Key) != "":
-		pemBytes = []byte(f.APNS.Key)
-	case strings.TrimSpace(f.APNS.KeyFile) != "":
-		b, err := readFile(strings.TrimSpace(f.APNS.KeyFile))
-		if err != nil {
-			return nil, fmt.Errorf("apns.key_file: %w", err)
-		}
-		pemBytes = b
-	default:
-		return nil, errors.New("apns.key / apns.key_file (or APNS_KEY_P8 / APNS_KEY_FILE) is required")
-	}
-	return ParseP8(pemBytes)
 }
 
 // ParseP8 parses an APNs auth key (.p8, PKCS#8 PEM) into an ECDSA P-256 private key.

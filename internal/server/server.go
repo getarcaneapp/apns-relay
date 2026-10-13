@@ -2,6 +2,8 @@
 package server
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +15,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/apns-relay/internal/apns"
 	"github.com/getarcaneapp/apns-relay/internal/config"
@@ -33,10 +37,7 @@ const (
 	controlRequestAge = 5 * time.Minute
 )
 
-var (
-	deviceTokenPattern = regexp.MustCompile(`^[0-9a-fA-F]{32,400}$`)
-	idPattern          = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
-)
+var deviceTokenPattern = regexp.MustCompile(`^[0-9a-fA-F]{32,400}$`)
 
 // Options wires the server's collaborators.
 type Options struct {
@@ -113,7 +114,25 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/events", s.handleEvents)
 	mux.HandleFunc("POST /v1/test", s.handleTest)
 
-	return s.middleware(mux)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := s.now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
+		w.Header().Set("Cache-Control", "no-store")
+		defer func() {
+			if p := recover(); p != nil {
+				s.log.ErrorContext(r.Context(), "panic in handler", "panic", p, "path", r.URL.Path)
+				writeError(w, http.StatusInternalServerError, "internal_error", "internal error")
+			}
+			// Never log bodies, tokens or query strings; paths carry only opaque ids.
+			s.log.DebugContext(r.Context(), "request",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", rec.status,
+				"duration", s.now().Sub(start))
+		}()
+		mux.ServeHTTP(rec, r)
+	})
 }
 
 // ---- middleware -----------------------------------------------------------
@@ -129,28 +148,6 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-func (s *Server) middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := s.now()
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
-		w.Header().Set("Cache-Control", "no-store")
-		defer func() {
-			if p := recover(); p != nil {
-				s.log.Error("panic in handler", slog.Any("panic", p), slog.String("path", r.URL.Path))
-				writeError(w, http.StatusInternalServerError, "internal_error", "internal error")
-			}
-			// Never log bodies, tokens or query strings; paths carry only opaque ids.
-			s.log.Debug("request",
-				slog.String("method", r.Method),
-				slog.String("path", r.URL.Path),
-				slog.Int("status", rec.status),
-				slog.Duration("duration", s.now().Sub(start)))
-		}()
-		next.ServeHTTP(rec, r)
-	})
-}
-
 // ---- helpers --------------------------------------------------------------
 
 type apiError struct {
@@ -161,9 +158,7 @@ type apiError struct {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		slog.Debug("write response", slog.String("error", err.Error()))
-	}
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
@@ -184,7 +179,7 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 }
 
 func decodeStrict(body []byte, v any) error {
-	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return err
@@ -198,10 +193,8 @@ func decodeStrict(body []byte, v any) error {
 func (s *Server) clientIP(r *http.Request) string {
 	if s.cfg.TrustProxyHeaders {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if i := strings.IndexByte(xff, ','); i > 0 {
-				return strings.TrimSpace(xff[:i])
-			}
-			return strings.TrimSpace(xff)
+			first, _, _ := strings.Cut(xff, ",")
+			return strings.TrimSpace(first)
 		}
 		if rip := r.Header.Get("X-Real-IP"); rip != "" {
 			return strings.TrimSpace(rip)
@@ -214,34 +207,31 @@ func (s *Server) clientIP(r *http.Request) string {
 	return host
 }
 
-func (s *Server) limitIP(w http.ResponseWriter, r *http.Request) bool {
-	if !s.ipLimit.Allow(s.clientIP(r)) {
-		s.metrics.RateLimitHits.Add(1)
-		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
-		return false
+func (s *Server) allow(w http.ResponseWriter, limiter *ratelimit.Limiter, key string) bool {
+	if limiter.Allow(key) {
+		return true
 	}
-	return true
+	s.metrics.RateLimitHits.Add(1)
+	writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+	return false
 }
 
 // authInstallation validates "Authorization: Bearer <installationId>.<secret>".
 func (s *Server) authInstallation(w http.ResponseWriter, r *http.Request) (*store.Installation, bool) {
-	if !s.limitIP(w, r) {
+	if !s.allow(w, s.ipLimit, s.clientIP(r)) {
 		return nil, false
 	}
-	auth := r.Header.Get("Authorization")
-	const prefix = "Bearer "
-	if !strings.HasPrefix(auth, prefix) {
+	cred, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "missing installation credential")
 		return nil, false
 	}
-	id, secret, ok := strings.Cut(strings.TrimSpace(auth[len(prefix):]), ".")
-	if !ok || !idPattern.MatchString(id) || secret == "" {
+	id, secret, ok := strings.Cut(strings.TrimSpace(cred), ".")
+	if !ok || !envelope.IDPattern.MatchString(id) || secret == "" {
 		writeError(w, http.StatusUnauthorized, "unauthorized", "malformed installation credential")
 		return nil, false
 	}
-	if !s.installLimit.Allow(id) {
-		s.metrics.RateLimitHits.Add(1)
-		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+	if !s.allow(w, s.installLimit, id) {
 		return nil, false
 	}
 	in, err := s.store.GetInstallation(r.Context(), id)
@@ -265,13 +255,11 @@ func (s *Server) signedRequest(w http.ResponseWriter, r *http.Request) ([]byte, 
 	var probe struct {
 		ChannelID string `json:"channelId"`
 	}
-	if err := json.Unmarshal(body, &probe); err != nil || !idPattern.MatchString(probe.ChannelID) {
+	if err := json.Unmarshal(body, &probe); err != nil || !envelope.IDPattern.MatchString(probe.ChannelID) {
 		writeError(w, http.StatusBadRequest, "bad_request", "body must be a JSON object with channelId")
 		return nil, nil, false
 	}
-	if !s.channelLimit.Allow(probe.ChannelID) {
-		s.metrics.RateLimitHits.Add(1)
-		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many requests for channel")
+	if !s.allow(w, s.channelLimit, probe.ChannelID) {
 		return nil, nil, false
 	}
 	sig, err := signing.DecodeSignature(r.Header.Get(signing.SignatureHeader))
@@ -279,33 +267,41 @@ func (s *Server) signedRequest(w http.ResponseWriter, r *http.Request) ([]byte, 
 		writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed "+signing.SignatureHeader)
 		return nil, nil, false
 	}
-	ch, err := s.store.GetChannel(r.Context(), probe.ChannelID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "unknown_channel", "channel not found")
-		} else {
-			s.internal(w, "load channel", err)
-		}
+	ch, pub, ok := s.channelKey(w, r, probe.ChannelID)
+	if !ok {
 		return nil, nil, false
 	}
-	if ch.RevokedAt != nil {
-		writeError(w, http.StatusGone, "channel_revoked", "channel has been revoked")
-		return nil, nil, false
-	}
-	pub, err := signing.NewPublicKey(signing.Algorithm(ch.Algorithm), ch.PublicKey)
-	if err != nil {
-		s.internal(w, "decode channel key", err)
-		return nil, nil, false
-	}
-	if err := pub.Verify(body, sig); err != nil {
+	if pub.Verify(body, sig) != nil {
 		writeError(w, http.StatusUnauthorized, "bad_signature", "signature does not verify")
 		return nil, nil, false
 	}
 	return body, ch, true
 }
 
-func (s *Server) internal(w http.ResponseWriter, what string, err error) {
-	s.log.Error(what, slog.String("error", err.Error()))
+// channelKey loads an active channel and its verification key, writing the error response on failure.
+func (s *Server) channelKey(w http.ResponseWriter, r *http.Request, id string) (*store.Channel, *signing.PublicKey, bool) {
+	ch, err := s.store.GetChannel(r.Context(), id)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "unknown_channel", "channel not found")
+		return nil, nil, false
+	case err != nil:
+		s.internal(w, r, "load channel", err)
+		return nil, nil, false
+	case ch.RevokedAt != nil:
+		writeError(w, http.StatusGone, "channel_revoked", "channel has been revoked")
+		return nil, nil, false
+	}
+	pub, err := signing.NewPublicKey(signing.Algorithm(ch.Algorithm), ch.PublicKey)
+	if err != nil {
+		s.internal(w, r, "decode channel key", err)
+		return nil, nil, false
+	}
+	return ch, pub, true
+}
+
+func (s *Server) internal(w http.ResponseWriter, r *http.Request, what string, err error) {
+	s.log.ErrorContext(r.Context(), "internal error", "op", what, "error", err)
 	writeError(w, http.StatusInternalServerError, "internal_error", "internal error")
 }
 
@@ -348,7 +344,7 @@ type createChannelRequest struct {
 }
 
 func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
-	if !s.limitIP(w, r) {
+	if !s.allow(w, s.ipLimit, s.clientIP(r)) {
 		return
 	}
 	body, ok := readBody(w, r)
@@ -372,14 +368,10 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	ch, created, err := s.store.CreateChannel(r.Context(), secrets.NewID("ch_"), string(alg), pub.Bytes())
 	if err != nil {
-		s.internal(w, "create channel", err)
+		s.internal(w, r, "create channel", err)
 		return
 	}
-	status := http.StatusCreated
-	if !created {
-		status = http.StatusOK
-	}
-	writeJSON(w, status, map[string]any{"channelId": ch.ID, "algorithm": ch.Algorithm, "createdAt": ch.CreatedAt.UTC()})
+	writeJSON(w, kit.Ternary(created, http.StatusCreated, http.StatusOK), map[string]any{"channelId": ch.ID, "algorithm": ch.Algorithm, "createdAt": ch.CreatedAt.UTC()})
 }
 
 type revokeChannelRequest struct {
@@ -406,10 +398,10 @@ func (s *Server) handleRevokeChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.RevokeChannel(r.Context(), ch.ID); err != nil {
-		s.internal(w, "revoke channel", err)
+		s.internal(w, r, "revoke channel", err)
 		return
 	}
-	s.log.Info("channel revoked", slog.String("channelId", ch.ID))
+	s.log.InfoContext(r.Context(), "channel revoked", "channelId", ch.ID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -422,14 +414,14 @@ type createInstallationRequest struct {
 	AppVersion      string `json:"appVersion"`
 }
 
-func validateInstallationFields(platform, env, token, appVersion string, requireToken bool) error {
+func validateInstallationFields(platform, env, token, appVersion string) error {
 	if platform != "" && platform != PlatformAPNS {
 		return fmt.Errorf("platform %q is not supported", platform)
 	}
 	if env != "" && !apns.ValidEnvironment(env) {
 		return errors.New("apnsEnvironment must be sandbox or production")
 	}
-	if (requireToken || token != "") && !deviceTokenPattern.MatchString(token) {
+	if !deviceTokenPattern.MatchString(token) {
 		return errors.New("deviceToken must be a hex string")
 	}
 	if len(appVersion) > maxAppVersionLen {
@@ -439,7 +431,7 @@ func validateInstallationFields(platform, env, token, appVersion string, require
 }
 
 func (s *Server) handleCreateInstallation(w http.ResponseWriter, r *http.Request) {
-	if !s.limitIP(w, r) {
+	if !s.allow(w, s.ipLimit, s.clientIP(r)) {
 		return
 	}
 	body, ok := readBody(w, r)
@@ -451,14 +443,12 @@ func (s *Server) handleCreateInstallation(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON: "+err.Error())
 		return
 	}
-	if req.Platform == "" {
-		req.Platform = PlatformAPNS
-	}
+	req.Platform = cmp.Or(req.Platform, PlatformAPNS)
 	if req.APNSEnvironment == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "apnsEnvironment is required")
 		return
 	}
-	if err := validateInstallationFields(req.Platform, req.APNSEnvironment, req.DeviceToken, req.AppVersion, true); err != nil {
+	if err := validateInstallationFields(req.Platform, req.APNSEnvironment, req.DeviceToken, req.AppVersion); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
@@ -466,7 +456,7 @@ func (s *Server) handleCreateInstallation(w http.ResponseWriter, r *http.Request
 	secret := secrets.NewSecret()
 	tokenEnc, err := s.sealer.Seal([]byte(strings.ToLower(req.DeviceToken)), []byte(id))
 	if err != nil {
-		s.internal(w, "seal token", err)
+		s.internal(w, r, "seal token", err)
 		return
 	}
 	in := &store.Installation{
@@ -477,8 +467,8 @@ func (s *Server) handleCreateInstallation(w http.ResponseWriter, r *http.Request
 		DeviceTokenEnc:  tokenEnc,
 		AppVersion:      req.AppVersion,
 	}
-	if err := s.store.CreateInstallation(r.Context(), in); err != nil {
-		s.internal(w, "create installation", err)
+	if err = s.store.CreateInstallation(r.Context(), in); err != nil {
+		s.internal(w, r, "create installation", err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"installationId": id, "installationSecret": secret})
@@ -504,17 +494,17 @@ func (s *Server) handleUpdateToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON: "+err.Error())
 		return
 	}
-	if err := validateInstallationFields("", req.APNSEnvironment, req.DeviceToken, req.AppVersion, true); err != nil {
+	if err := validateInstallationFields("", req.APNSEnvironment, req.DeviceToken, req.AppVersion); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	tokenEnc, err := s.sealer.Seal([]byte(strings.ToLower(req.DeviceToken)), []byte(in.ID))
 	if err != nil {
-		s.internal(w, "seal token", err)
+		s.internal(w, r, "seal token", err)
 		return
 	}
-	if err := s.store.UpdateInstallationToken(r.Context(), in.ID, tokenEnc, req.APNSEnvironment, req.AppVersion); err != nil {
-		s.internal(w, "update token", err)
+	if err = s.store.UpdateInstallationToken(r.Context(), in.ID, tokenEnc, req.APNSEnvironment, req.AppVersion); err != nil {
+		s.internal(w, r, "update token", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -526,7 +516,7 @@ func (s *Server) handleDeleteInstallation(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err := s.store.DeleteInstallation(r.Context(), in.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.internal(w, "delete installation", err)
+		s.internal(w, r, "delete installation", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -557,29 +547,15 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_pairing_token", err.Error())
 		return
 	}
-	if !idPattern.MatchString(claims.ChannelID) || len(claims.Subject) > maxSubjectLen || len(claims.Nonce) > 128 {
+	if !envelope.IDPattern.MatchString(claims.ChannelID) || len(claims.Subject) > maxSubjectLen || len(claims.Nonce) > 128 {
 		writeError(w, http.StatusBadRequest, "bad_pairing_token", "invalid claim values")
 		return
 	}
-	ch, err := s.store.GetChannel(r.Context(), claims.ChannelID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "unknown_channel", "channel not found")
-		} else {
-			s.internal(w, "load channel", err)
-		}
+	ch, pub, ok := s.channelKey(w, r, claims.ChannelID)
+	if !ok {
 		return
 	}
-	if ch.RevokedAt != nil {
-		writeError(w, http.StatusGone, "channel_revoked", "channel has been revoked")
-		return
-	}
-	pub, err := signing.NewPublicKey(signing.Algorithm(ch.Algorithm), ch.PublicKey)
-	if err != nil {
-		s.internal(w, "decode channel key", err)
-		return
-	}
-	if err := signing.VerifyPairingToken(pub, claims, payload, sig, s.now()); err != nil {
+	if err = signing.VerifyPairingToken(pub, claims, payload, sig, s.now()); err != nil {
 		writeError(w, http.StatusUnauthorized, "bad_pairing_token", err.Error())
 		return
 	}
@@ -593,7 +569,7 @@ func (s *Server) handlePair(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, store.ErrNotFound):
 			writeError(w, http.StatusNotFound, "unknown_channel", "channel not found")
 		default:
-			s.internal(w, "pair", err)
+			s.internal(w, r, "pair", err)
 		}
 		return
 	}
@@ -615,12 +591,12 @@ func (s *Server) handleUnpair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req unpairRequest
-	if err := decodeStrict(body, &req); err != nil || !idPattern.MatchString(req.RecipientID) {
+	if err := decodeStrict(body, &req); err != nil || !envelope.IDPattern.MatchString(req.RecipientID) {
 		writeError(w, http.StatusBadRequest, "bad_request", "recipientId is required")
 		return
 	}
 	if err := s.store.Unpair(r.Context(), req.RecipientID, in.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.internal(w, "unpair", err)
+		s.internal(w, r, "unpair", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -652,7 +628,7 @@ func (s *Server) enqueue(w http.ResponseWriter, r *http.Request, ch *store.Chann
 	}
 	recipients, err := s.store.ResolveRecipients(r.Context(), ch.ID, env.RecipientIDs)
 	if err != nil {
-		s.internal(w, "resolve recipients", err)
+		s.internal(w, r, "resolve recipients", err)
 		return
 	}
 	known := make(map[string]bool, len(recipients))
@@ -667,23 +643,23 @@ func (s *Server) enqueue(w http.ResponseWriter, r *http.Request, ch *store.Chann
 			unknown = append(unknown, id)
 		}
 	}
-	if err := s.store.EnqueueEvent(r.Context(), ch.ID, env.EventID, envelope.DedupeKey(env), deliveries); err != nil {
+	if err = s.store.EnqueueEvent(r.Context(), ch.ID, env.EventID, envelope.DedupeKey(env), deliveries); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			s.metrics.EventsDuplicate.Add(1)
 			writeJSON(w, http.StatusOK, map[string]any{"eventId": env.EventID, "duplicate": true, "queued": 0, "unknownRecipientIds": []string{}})
 			return
 		}
-		s.internal(w, "enqueue event", err)
+		s.internal(w, r, "enqueue event", err)
 		return
 	}
 	s.metrics.EventsAccepted.Add(1)
 	s.metrics.DeliveriesQueued.Add(int64(len(deliveries)))
-	s.log.Info("event accepted",
-		slog.String("channelId", ch.ID),
-		slog.String("eventId", env.EventID),
-		slog.String("type", env.Type),
-		slog.Int("queued", len(deliveries)),
-		slog.Int("unknownRecipients", len(unknown)))
+	s.log.InfoContext(r.Context(), "event accepted",
+		"channelId", ch.ID,
+		"eventId", env.EventID,
+		"type", env.Type,
+		"queued", len(deliveries),
+		"unknownRecipients", len(unknown))
 	if len(deliveries) > 0 {
 		s.wake()
 	}
@@ -714,16 +690,12 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 	if !s.checkFreshness(w, req.IssuedAt) {
 		return
 	}
-	if !idPattern.MatchString(req.Nonce) || len(req.Nonce) > 40 {
+	if !envelope.IDPattern.MatchString(req.Nonce) || len(req.Nonce) > 40 {
 		writeError(w, http.StatusBadRequest, "bad_request", "nonce must be 1-40 url-safe characters")
 		return
 	}
-	if req.Title == "" {
-		req.Title = "Arcane test notification"
-	}
-	if req.Body == "" {
-		req.Body = "Push notifications are working for this device."
-	}
+	req.Title = cmp.Or(req.Title, "Arcane test notification")
+	req.Body = cmp.Or(req.Body, "Push notifications are working for this device.")
 	env := &envelope.Envelope{
 		Version:      envelope.Version,
 		EventID:      "test-" + req.Nonce,

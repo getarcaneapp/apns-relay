@@ -2,15 +2,17 @@
 package envelope
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	kit "go.getarcane.app/kit/pkg"
 )
 
 // Version is the only envelope version the relay accepts.
@@ -60,7 +62,8 @@ const (
 )
 
 var (
-	idPattern      = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+	// IDPattern matches opaque relay identifiers (channels, installations, recipients, environments).
+	IDPattern      = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
 	eventIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,64}$`)
 	tabPattern     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 )
@@ -106,7 +109,7 @@ type Envelope struct {
 // Parse decodes and validates a raw envelope body.
 func Parse(raw []byte, now time.Time, maxAge time.Duration) (*Envelope, error) {
 	var env Envelope
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&env); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalid, err)
@@ -148,21 +151,10 @@ func (e *Envelope) Validate(now time.Time, maxAge time.Duration) error {
 	if !Severities[e.Severity] {
 		add("severity %q is not supported", e.Severity)
 	}
-	if !idPattern.MatchString(e.ChannelID) {
+	if !IDPattern.MatchString(e.ChannelID) {
 		add("channelId is invalid")
 	}
-	problems = append(problems, e.contentProblems()...)
-	problems = append(problems, e.recipientProblems()...)
-	if len(problems) > 0 {
-		return fmt.Errorf("%w: %s", ErrInvalid, strings.Join(problems, "; "))
-	}
-	return nil
-}
-
-func (e *Envelope) contentProblems() []string {
-	var problems []string
-	add := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
-	if e.EnvironmentID != "" && !idPattern.MatchString(e.EnvironmentID) {
+	if e.EnvironmentID != "" && !IDPattern.MatchString(e.EnvironmentID) {
 		add("environmentId is invalid")
 	}
 	if utf8.RuneCountInString(e.EnvironmentName) > MaxEnvironmentNameLen {
@@ -188,30 +180,21 @@ func (e *Envelope) contentProblems() []string {
 	if err := e.Route.Validate(); err != nil {
 		add("route: %v", err)
 	}
-	return problems
-}
-
-func (e *Envelope) recipientProblems() []string {
-	var problems []string
 	if len(e.RecipientIDs) == 0 {
-		problems = append(problems, "recipientIds must not be empty")
+		add("recipientIds must not be empty")
 	}
 	if len(e.RecipientIDs) > MaxRecipients {
-		problems = append(problems, fmt.Sprintf("recipientIds exceeds %d entries", MaxRecipients))
+		add("recipientIds exceeds %d entries", MaxRecipients)
 	}
-	seen := make(map[string]struct{}, len(e.RecipientIDs))
-	for _, r := range e.RecipientIDs {
-		if !idPattern.MatchString(r) {
-			problems = append(problems, "recipientIds contains an invalid id")
-			break
-		}
-		if _, dup := seen[r]; dup {
-			problems = append(problems, "recipientIds contains duplicates")
-			break
-		}
-		seen[r] = struct{}{}
+	if slices.ContainsFunc(e.RecipientIDs, func(r string) bool { return !IDPattern.MatchString(r) }) {
+		add("recipientIds contains an invalid id")
+	} else if len(kit.Unique(e.RecipientIDs)) != len(e.RecipientIDs) {
+		add("recipientIds contains duplicates")
 	}
-	return problems
+	if len(problems) > 0 {
+		return fmt.Errorf("%w: %s", ErrInvalid, strings.Join(problems, "; "))
+	}
+	return nil
 }
 
 // Validate checks that the route is one the app can consume.
@@ -222,11 +205,11 @@ func (r Route) Validate() error {
 			return errors.New("tab is required for kind=tab")
 		}
 	case RouteContainer, RouteImage:
-		if !idPattern.MatchString(r.EnvironmentID) || !idPattern.MatchString(r.ID) {
+		if !IDPattern.MatchString(r.EnvironmentID) || !IDPattern.MatchString(r.ID) {
 			return fmt.Errorf("environmentId and id are required for kind=%s", r.Kind)
 		}
 	case RouteEnvironment:
-		if !idPattern.MatchString(r.EnvironmentID) {
+		if !IDPattern.MatchString(r.EnvironmentID) {
 			return errors.New("environmentId is required for kind=environment")
 		}
 	case RouteActivities, RouteEvents:
@@ -279,16 +262,11 @@ type APNSPayload struct {
 // share a key, so it doubles as the apns-collapse-id (at most 64 bytes) and
 // replaces the copy already on the device instead of stacking a new one.
 func DedupeKey(e *Envelope) string {
-	h := sha256.New()
 	parts := []string{e.ChannelID, e.Type, e.EnvironmentID, e.Title, e.Body}
 	if e.Resource != nil {
 		parts = append(parts, e.Resource.Kind, e.Resource.ID)
 	}
-	for _, part := range parts {
-		h.Write([]byte(part))
-		h.Write([]byte{0})
-	}
-	return "d-" + hex.EncodeToString(h.Sum(nil))[:40]
+	return "d-" + kit.SHA256Hex(strings.Join(parts, "\x00") + "\x00")[:40]
 }
 
 // ThreadID groups notifications per environment and event type, so image

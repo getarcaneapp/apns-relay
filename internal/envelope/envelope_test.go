@@ -44,7 +44,7 @@ func TestParseValid(t *testing.T) {
 		t.Fatal("payload must not contain recipient ids")
 	}
 	var decoded map[string]any
-	if err := json.Unmarshal(payload, &decoded); err != nil {
+	if err = json.Unmarshal(payload, &decoded); err != nil {
 		t.Fatal(err)
 	}
 	if decoded["aps"].(map[string]any)["alert"].(map[string]any)["title"] != "Container updated" {
@@ -139,7 +139,7 @@ func TestPayloadGroupsByEnvironmentAndType(t *testing.T) {
 		t.Fatal(err)
 	}
 	var p APNSPayload
-	if err := json.Unmarshal(raw, &p); err != nil {
+	if err = json.Unmarshal(raw, &p); err != nil {
 		t.Fatal(err)
 	}
 	if p.APS.ThreadID != "env-1:container_update" {

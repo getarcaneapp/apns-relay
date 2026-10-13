@@ -2,6 +2,7 @@
 package worker
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -43,30 +44,14 @@ type Worker struct {
 
 // New creates a worker with sensible defaults for unset options.
 func New(o Options) *Worker {
-	if o.Concurrency <= 0 {
-		o.Concurrency = 8
-	}
-	if o.MaxAttempts <= 0 {
-		o.MaxAttempts = 8
-	}
-	if o.Retention <= 0 {
-		o.Retention = 24 * time.Hour
-	}
-	if o.PollInterval <= 0 {
-		o.PollInterval = 2 * time.Second
-	}
-	if o.Lease <= 0 {
-		o.Lease = time.Minute
-	}
-	if o.BatchSize <= 0 {
-		o.BatchSize = 64
-	}
-	if o.BaseBackoff <= 0 {
-		o.BaseBackoff = 5 * time.Second
-	}
-	if o.MaxBackoff <= 0 {
-		o.MaxBackoff = 15 * time.Minute
-	}
+	o.Concurrency = cmp.Or(o.Concurrency, 8)
+	o.MaxAttempts = cmp.Or(o.MaxAttempts, 8)
+	o.Retention = cmp.Or(o.Retention, 24*time.Hour)
+	o.PollInterval = cmp.Or(o.PollInterval, 2*time.Second)
+	o.Lease = cmp.Or(o.Lease, time.Minute)
+	o.BatchSize = cmp.Or(o.BatchSize, 64)
+	o.BaseBackoff = cmp.Or(o.BaseBackoff, 5*time.Second)
+	o.MaxBackoff = cmp.Or(o.MaxBackoff, 15*time.Minute)
 	if o.Now == nil {
 		o.Now = time.Now
 	}
@@ -93,7 +78,7 @@ func (w *Worker) Run(ctx context.Context) {
 	for {
 		busy, err := w.Drain(ctx)
 		if err != nil && ctx.Err() == nil {
-			w.o.Logger.Error("drain failed", slog.String("error", err.Error()))
+			w.o.Logger.ErrorContext(ctx, "drain failed", "error", err)
 		}
 		if busy {
 			// More work may be waiting; loop immediately.
@@ -110,8 +95,8 @@ func (w *Worker) Run(ctx context.Context) {
 		case <-w.wake:
 		case <-ticker.C:
 		case <-prune.C:
-			if err := w.o.Store.Prune(ctx, w.o.Retention); err != nil && ctx.Err() == nil {
-				w.o.Logger.Error("prune failed", slog.String("error", err.Error()))
+			if err = w.o.Store.Prune(ctx, w.o.Retention); err != nil && ctx.Err() == nil {
+				w.o.Logger.ErrorContext(ctx, "prune failed", "error", err)
 			}
 		}
 	}
@@ -147,7 +132,7 @@ func (w *Worker) Drain(ctx context.Context) (bool, error) {
 }
 
 func (w *Worker) process(ctx context.Context, d store.Delivery) {
-	log := w.o.Logger.With(slog.Int64("deliveryId", d.ID), slog.String("eventId", d.EventID), slog.String("channelId", d.ChannelID))
+	log := w.o.Logger.With("deliveryId", d.ID, "eventId", d.EventID, "channelId", d.ChannelID)
 	if d.Attempts == 0 {
 		w.o.Metrics.ObserveQueueLatency(w.o.Now().Sub(d.CreatedAt).Milliseconds())
 	}
@@ -183,26 +168,27 @@ func (w *Worker) process(ctx context.Context, d store.Delivery) {
 		return
 	}
 	w.o.Metrics.ObserveAPNSStatus(res.StatusCode, res.Reason)
+	apnsReason := fmt.Sprintf("apns %d %s", res.StatusCode, res.Reason)
 	switch res.Outcome {
 	case apns.OutcomeSent:
-		if err := w.o.Store.MarkSent(ctx, d.ID); err != nil {
-			log.Error("mark sent failed", slog.String("error", err.Error()))
+		if err = w.o.Store.MarkSent(ctx, d.ID); err != nil {
+			log.ErrorContext(ctx, "mark sent failed", "error", err)
 			return
 		}
 		w.o.Metrics.DeliveriesSent.Add(1)
-		log.Info("delivered", slog.String("apnsId", res.APNSID), slog.String("environment", in.APNSEnvironment))
+		log.InfoContext(ctx, "delivered", "apnsId", res.APNSID, "environment", in.APNSEnvironment)
 	case apns.OutcomeRetry:
-		w.retry(ctx, d, fmt.Sprintf("apns %d %s", res.StatusCode, res.Reason), log)
+		w.retry(ctx, d, apnsReason, log)
 	case apns.OutcomeInvalidToken:
-		if err := w.o.Store.DeleteInstallation(ctx, in.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
-			log.Error("remove installation failed", slog.String("error", err.Error()))
+		if err = w.o.Store.DeleteInstallation(ctx, in.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
+			log.ErrorContext(ctx, "remove installation failed", "error", err)
 		} else {
 			w.o.Metrics.InvalidTokenRemoved.Add(1)
 		}
-		w.terminal(ctx, d, store.DeliveryDropped, fmt.Sprintf("apns %d %s", res.StatusCode, res.Reason), log)
-		log.Info("installation removed after invalid token", slog.String("installationId", in.ID), slog.String("reason", res.Reason))
+		w.terminal(ctx, d, store.DeliveryDropped, apnsReason, log)
+		log.InfoContext(ctx, "installation removed after invalid token", "installationId", in.ID, "reason", res.Reason)
 	case apns.OutcomeFailed:
-		w.terminal(ctx, d, store.DeliveryFailed, fmt.Sprintf("apns %d %s", res.StatusCode, res.Reason), log)
+		w.terminal(ctx, d, store.DeliveryFailed, apnsReason, log)
 	}
 }
 
@@ -212,35 +198,28 @@ func (w *Worker) retry(ctx context.Context, d store.Delivery, reason string, log
 		w.terminal(ctx, d, store.DeliveryFailed, "max attempts: "+reason, log)
 		return
 	}
-	next := w.o.Now().Add(w.backoff(attempt))
+	// Exponential backoff with full jitter, capped at MaxBackoff.
+	exp := min(float64(w.o.BaseBackoff)*math.Pow(2, float64(attempt-1)), float64(w.o.MaxBackoff))
+	next := w.o.Now().Add(time.Duration(exp/2 + rand.Float64()*exp/2)) //nolint:gosec // jitter, not security-sensitive
 	if err := w.o.Store.MarkRetry(ctx, d.ID, next, reason); err != nil {
-		log.Error("mark retry failed", slog.String("error", err.Error()))
+		log.ErrorContext(ctx, "mark retry failed", "error", err)
 		return
 	}
 	w.o.Metrics.DeliveriesRetried.Add(1)
-	log.Warn("delivery retry scheduled", slog.Int("attempt", attempt), slog.Time("nextAttemptAt", next), slog.String("reason", reason))
+	log.WarnContext(ctx, "delivery retry scheduled", "attempt", attempt, "nextAttemptAt", next, "reason", reason)
 }
 
 func (w *Worker) terminal(ctx context.Context, d store.Delivery, status, reason string, log *slog.Logger) {
 	if err := w.o.Store.MarkTerminal(ctx, d.ID, status, reason); err != nil {
-		log.Error("mark terminal failed", slog.String("error", err.Error()))
+		log.ErrorContext(ctx, "mark terminal failed", "error", err)
 		return
 	}
 	switch status {
 	case store.DeliveryFailed:
 		w.o.Metrics.DeliveriesFailed.Add(1)
-		log.Error("delivery failed", slog.String("reason", reason))
+		log.ErrorContext(ctx, "delivery failed", "reason", reason)
 	default:
 		w.o.Metrics.DeliveriesDropped.Add(1)
-		log.Info("delivery dropped", slog.String("reason", reason))
+		log.InfoContext(ctx, "delivery dropped", "reason", reason)
 	}
-}
-
-// backoff grows exponentially with full jitter, capped at MaxBackoff.
-func (w *Worker) backoff(attempt int) time.Duration {
-	exp := float64(w.o.BaseBackoff) * math.Pow(2, float64(attempt-1))
-	if exp > float64(w.o.MaxBackoff) {
-		exp = float64(w.o.MaxBackoff)
-	}
-	return time.Duration(exp/2 + rand.Float64()*exp/2) //nolint:gosec // jitter, not security-sensitive
 }

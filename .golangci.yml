@@ -1,0 +1,156 @@
+# Slightly Modified Version of docker's golangci lint configuration to fit arcanes standards
+version: "2"
+
+run:
+  go: "1.27.2"
+  build-tags:
+    - exclude_frontend
+    - playwright
+  timeout: 5m
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gci
+    - gofumpt
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+  settings:
+    gci:
+      sections:
+        - prefix(arena,archive/,bufio,bytes,cmp,compress/,container/,context,crypto,database/,debug/,embed,encoding,errors,expvar,flag,fmt,go/,hash,html,image,index/,io,iter,log,maps,math,mime,net,os,path,plugin,reflect,regexp,runtime,slices,sort,strconv,strings,structs,sync,syscall,testing,text/,time,unicode,unique,unsafe,uuid,weak)
+        - default
+        - localmodule
+      custom-order: true
+    gofumpt:
+      extra:
+        group-params: true
+        clothe-returns: true
+        balance-calls: true
+
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - depguard
+    - errcheck
+    - errorlint
+    - forbidigo
+    - gocognit
+    - gocritic
+    - gomodguard_v2
+    - govet
+    - importas
+    - ineffassign
+    - lll
+    - misspell
+    - nakedret
+    - nolintlint
+    - perfsprint
+    - revive
+    - sloglint
+    - staticcheck
+    - testifylint
+    - unconvert
+    - unparam
+    - unused
+
+  disable:
+    - gocyclo
+
+  settings:
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: io/ioutil
+              desc: io/ioutil package has been deprecated
+            - pkg: github.com/docker/docker/errdefs
+              desc: use github.com/containerd/errdefs instead.
+            - pkg: golang.org/x/exp/maps
+              desc: use stdlib maps package
+            - pkg: golang.org/x/exp/slices
+              desc: use stdlib slices package
+            - pkg: "github.com/google/uuid"
+              desc: Use stdlib uuid instead.
+            - pkg: "gopkg.in/yaml.v3"
+              desc: Use go.yaml.in/yaml/v4 instead.
+
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: 'context\.Background'
+          pkg: "^context$"
+          msg: "in tests, use t.Context() instead of context.Background()"
+        - pattern: 'context\.TODO'
+          pkg: "^context$"
+          msg: "in tests, use t.Context() instead of context.TODO()"
+
+    gocritic:
+      disabled-checks:
+        - paramTypeCombine
+        - unnamedResult
+        - whyNoLint
+      enabled-tags:
+        - diagnostic
+        - opinionated
+        - style
+
+    gocognit:
+      min-complexity: 40
+
+    importas:
+      alias:
+        - pkg: go.getarcane.app/docker
+          alias: docker
+        - pkg: github.com/getarcaneapp/arcane/backend/v2/internal/docker
+          alias: dockerInternal
+
+    lll:
+      line-length: 200
+
+    govet:
+      enable:
+        - shadow
+      settings:
+        shadow:
+          strict: true
+
+    grouper:
+      const-require-single-const: true
+      const-require-grouping: true
+      var-require-single-var: true
+      var-require-grouping: true
+      type-require-single-type: true
+      type-require-grouping: true
+
+    nakedret:
+      # Disallow naked returns if func has more lines of code than this setting.
+      # Default: 30
+      max-func-lines: 0
+
+    revive:
+      rules:
+        - name: package-comments
+          disabled: true
+
+    sloglint:
+      context: "all" # https://github.com/go-simpler/sloglint#context-only
+      kv-only: true # https://github.com/go-simpler/sloglint#key-value-pairs-only
+      static-msg: true # https://github.com/go-simpler/sloglint#static-message
+      key-naming-case: camel
+
+  exclusions:
+    generated: strict
+    rules:
+      # The legacy edge message protocol uses deprecated tunnel.proto messages until v3 removes both.
+      - path: pkg/libarcane/edge/
+        linters: [staticcheck]
+        text: "SA1019: .*proto/tunnel/v1"

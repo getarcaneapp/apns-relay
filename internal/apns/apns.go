@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	kit "go.getarcane.app/kit/pkg"
 )
 
 // Environment selects the APNs host.
@@ -109,16 +111,13 @@ func NewClient(cfg Config) (*Client, error) {
 	return &Client{
 		cfg:    cfg,
 		http:   &http.Client{Transport: transport, Timeout: 30 * time.Second},
-		tokens: newTokenProvider(cfg.KeyID, cfg.TeamID, cfg.PrivateKey, time.Now),
+		tokens: &tokenProvider{keyID: cfg.KeyID, teamID: cfg.TeamID, key: cfg.PrivateKey, now: time.Now},
 	}, nil
 }
 
 // Send delivers one notification.
 func (c *Client) Send(ctx context.Context, n Notification) (Result, error) {
-	base := c.cfg.ProductionURL
-	if n.Environment == EnvironmentSandbox {
-		base = c.cfg.SandboxURL
-	}
+	base := kit.Ternary(n.Environment == EnvironmentSandbox, c.cfg.SandboxURL, c.cfg.ProductionURL)
 	token, err := c.tokens.Token()
 	if err != nil {
 		return Result{Outcome: OutcomeRetry}, err
@@ -154,28 +153,27 @@ func (c *Client) Send(ctx context.Context, n Notification) (Result, error) {
 	}
 	_ = json.Unmarshal(body, &parsed)
 	res.Reason = parsed.Reason
-	res.Outcome = classify(resp.StatusCode, parsed.Reason)
+	switch parsed.Reason {
+	case "BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic", "ExpiredToken":
+		res.Outcome = OutcomeInvalidToken
+	case "ExpiredProviderToken", "TooManyProviderTokenUpdates", "TooManyRequests", "InternalServerError", "ServiceUnavailable", "Shutdown", "IdleTimeout":
+		res.Outcome = OutcomeRetry
+	default:
+		switch {
+		case resp.StatusCode == http.StatusGone:
+			res.Outcome = OutcomeInvalidToken
+		case resp.StatusCode == http.StatusTooManyRequests, resp.StatusCode >= 500:
+			res.Outcome = OutcomeRetry
+		default:
+			res.Outcome = OutcomeFailed
+		}
+	}
 	if resp.StatusCode == http.StatusForbidden && parsed.Reason == "ExpiredProviderToken" {
-		c.tokens.Invalidate()
+		c.tokens.mu.Lock()
+		c.tokens.token = ""
+		c.tokens.mu.Unlock()
 	}
 	return res, nil
-}
-
-func classify(status int, reason string) Outcome {
-	switch reason {
-	case "BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic", "ExpiredToken":
-		return OutcomeInvalidToken
-	case "ExpiredProviderToken", "TooManyProviderTokenUpdates", "TooManyRequests", "InternalServerError", "ServiceUnavailable", "Shutdown", "IdleTimeout":
-		return OutcomeRetry
-	}
-	switch {
-	case status == http.StatusGone:
-		return OutcomeInvalidToken
-	case status == http.StatusTooManyRequests, status >= 500:
-		return OutcomeRetry
-	default:
-		return OutcomeFailed
-	}
 }
 
 // tokenProvider mints ES256 provider tokens and reuses them for up to 50 minutes,
@@ -193,10 +191,6 @@ type tokenProvider struct {
 
 const tokenLifetime = 50 * time.Minute
 
-func newTokenProvider(keyID, teamID string, key *ecdsa.PrivateKey, now func() time.Time) *tokenProvider {
-	return &tokenProvider{keyID: keyID, teamID: teamID, key: key, now: now}
-}
-
 func (p *tokenProvider) Token() (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -204,42 +198,28 @@ func (p *tokenProvider) Token() (string, error) {
 	if p.token != "" && now.Sub(p.issuedAt) < tokenLifetime {
 		return p.token, nil
 	}
-	tok, err := mintJWT(p.keyID, p.teamID, p.key, now)
-	if err != nil {
-		return "", err
-	}
-	p.token, p.issuedAt = tok, now
-	return tok, nil
-}
-
-func (p *tokenProvider) Invalidate() {
-	p.mu.Lock()
-	p.token = ""
-	p.mu.Unlock()
-}
-
-func mintJWT(keyID, teamID string, key *ecdsa.PrivateKey, now time.Time) (string, error) {
-	header, err := json.Marshal(map[string]string{"alg": "ES256", "kid": keyID})
+	header, err := json.Marshal(map[string]string{"alg": "ES256", "kid": p.keyID})
 	if err != nil {
 		return "", err
 	}
 	claims, err := json.Marshal(struct {
 		Iss string `json:"iss"`
 		Iat int64  `json:"iat"`
-	}{teamID, now.Unix()})
+	}{p.teamID, now.Unix()})
 	if err != nil {
 		return "", err
 	}
 	signingInput := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(claims)
 	digest := sha256.Sum256([]byte(signingInput))
-	r, s, err := ecdsa.Sign(rand.Reader, key, digest[:])
+	r, s, err := ecdsa.Sign(rand.Reader, p.key, digest[:])
 	if err != nil {
 		return "", fmt.Errorf("sign provider token: %w", err)
 	}
 	sig := make([]byte, 64)
 	r.FillBytes(sig[:32])
 	s.FillBytes(sig[32:])
-	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig), nil
+	p.token, p.issuedAt = signingInput+"."+base64.RawURLEncoding.EncodeToString(sig), now
+	return p.token, nil
 }
 
 // ParseJWTSignature is exported for tests: splits a compact JWT signature into r,s.
@@ -253,10 +233,10 @@ type LogSender struct {
 }
 
 // Send logs the delivery metadata (never the payload or token) and reports success.
-func (l *LogSender) Send(_ context.Context, n Notification) (Result, error) {
-	l.Log.Info("apns log mode: would send",
-		slog.String("environment", string(n.Environment)),
-		slog.Int("payloadBytes", len(n.Payload)),
-		slog.String("collapseId", n.CollapseID))
+func (l *LogSender) Send(ctx context.Context, n Notification) (Result, error) {
+	l.Log.InfoContext(ctx, "apns log mode: would send",
+		"environment", string(n.Environment),
+		"payloadBytes", len(n.Payload),
+		"collapseId", n.CollapseID)
 	return Result{Outcome: OutcomeSent, StatusCode: http.StatusOK, APNSID: "log-mode"}, nil
 }

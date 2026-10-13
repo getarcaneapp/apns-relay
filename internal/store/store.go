@@ -58,7 +58,7 @@ func Open(path string) (*Store, error) {
 	db.SetMaxOpenConns(4)
 	db.SetConnMaxLifetime(0)
 	s := &Store{db: db, now: time.Now}
-	if err := s.migrate(context.Background()); err != nil {
+	if err = s.migrate(context.Background()); err != nil { //nolint:forbidigo // Open has no caller context
 		_ = db.Close()
 		return nil, err
 	}
@@ -152,15 +152,16 @@ func (s *Store) migrate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, migrations[i]); err != nil {
+		if _, err = tx.ExecContext(ctx, migrations[i]); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("migration %d: %w", i+1, err)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, i+1, s.now().Unix()); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, i+1, s.now().Unix()); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
-		if err := tx.Commit(); err != nil {
+		err = tx.Commit()
+		if err != nil {
 			return err
 		}
 	}
@@ -199,10 +200,11 @@ func (s *Store) CreateChannel(ctx context.Context, id, algorithm string, publicK
 		return nil, false, err
 	}
 	now := s.now()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO channels(id, algorithm, public_key, created_at) VALUES (?, ?, ?, ?)`, id, algorithm, publicKey, now.Unix()); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO channels(id, algorithm, public_key, created_at) VALUES (?, ?, ?, ?)`, id, algorithm, publicKey, now.Unix()); err != nil {
 		return nil, false, err
 	}
-	if err := tx.Commit(); err != nil {
+	err = tx.Commit()
+	if err != nil {
 		return nil, false, err
 	}
 	return &Channel{ID: id, Algorithm: algorithm, PublicKey: publicKey, CreatedAt: now}, true, nil
@@ -242,20 +244,22 @@ func (s *Store) RevokeChannel(ctx context.Context, id string) error {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		var exists int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM channels WHERE id = ?`, id).Scan(&exists); err != nil {
+		err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM channels WHERE id = ?`, id).Scan(&exists)
+		if err != nil {
 			return err
 		}
 		if exists == 0 {
 			return ErrNotFound
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM bindings WHERE channel_id = ?`, id); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM bindings WHERE channel_id = ?`, id); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM pairing_nonces WHERE channel_id = ?`, id); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM pairing_nonces WHERE channel_id = ?`, id); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE deliveries SET status = ?, payload = NULL, last_error = 'channel revoked', updated_at = ? WHERE channel_id = ? AND status = ?`, DeliveryDropped, now, id, DeliveryPending); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE deliveries SET status = ?, payload = NULL, last_error = 'channel revoked', updated_at = ? WHERE channel_id = ? AND status = ?`,
+		DeliveryDropped, now, id, DeliveryPending); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -303,7 +307,8 @@ func (s *Store) GetInstallation(ctx context.Context, id string) (*Installation, 
 
 // UpdateInstallationToken replaces the device token (and optionally environment/app version).
 func (s *Store) UpdateInstallationToken(ctx context.Context, id string, tokenEnc []byte, apnsEnvironment, appVersion string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE installations SET device_token_enc = ?, apns_environment = COALESCE(NULLIF(?, ''), apns_environment), app_version = COALESCE(NULLIF(?, ''), app_version), last_seen_at = ? WHERE id = ?`,
+	res, err := s.db.ExecContext(ctx, `UPDATE installations SET device_token_enc = ?,
+		apns_environment = COALESCE(NULLIF(?, ''), apns_environment), app_version = COALESCE(NULLIF(?, ''), app_version), last_seen_at = ? WHERE id = ?`,
 		tokenEnc, apnsEnvironment, appVersion, s.now().Unix(), id)
 	if err != nil {
 		return err
@@ -327,7 +332,7 @@ func (s *Store) DeleteInstallation(ctx context.Context, id string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `UPDATE deliveries SET status = ?, payload = NULL, last_error = 'installation removed', updated_at = ? WHERE installation_id = ? AND status = ?`,
+	if _, err = tx.ExecContext(ctx, `UPDATE deliveries SET status = ?, payload = NULL, last_error = 'installation removed', updated_at = ? WHERE installation_id = ? AND status = ?`,
 		DeliveryDropped, s.now().Unix(), id, DeliveryPending); err != nil {
 		return err
 	}
@@ -363,7 +368,7 @@ func (s *Store) Pair(ctx context.Context, recipientID, installationID, channelID
 	defer func() { _ = tx.Rollback() }()
 
 	var revoked sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT revoked_at FROM channels WHERE id = ?`, channelID).Scan(&revoked); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT revoked_at FROM channels WHERE id = ?`, channelID).Scan(&revoked); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -372,8 +377,8 @@ func (s *Store) Pair(ctx context.Context, recipientID, installationID, channelID
 	if revoked.Valid {
 		return nil, ErrRevoked
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO pairing_nonces(channel_id, nonce, expires_at) VALUES (?, ?, ?)`, channelID, nonce, nonceExpiry.Unix()); err != nil {
-		if isUniqueViolation(err) {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO pairing_nonces(channel_id, nonce, expires_at) VALUES (?, ?, ?)`, channelID, nonce, nonceExpiry.Unix()); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			return nil, ErrConflict
 		}
 		return nil, err
@@ -385,7 +390,7 @@ func (s *Store) Pair(ctx context.Context, recipientID, installationID, channelID
 		Scan(&existing.RecipientID, &existing.Subject, &created)
 	switch {
 	case err == nil:
-		if _, err := tx.ExecContext(ctx, `UPDATE bindings SET subject = ? WHERE recipient_id = ?`, subject, existing.RecipientID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE bindings SET subject = ? WHERE recipient_id = ?`, subject, existing.RecipientID); err != nil {
 			return nil, err
 		}
 		existing.InstallationID, existing.ChannelID, existing.Subject = installationID, channelID, subject
@@ -395,11 +400,12 @@ func (s *Store) Pair(ctx context.Context, recipientID, installationID, channelID
 		return nil, err
 	}
 	now := s.now()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO bindings(recipient_id, installation_id, channel_id, subject, created_at) VALUES (?, ?, ?, ?, ?)`,
+	if _, err = tx.ExecContext(ctx, `INSERT INTO bindings(recipient_id, installation_id, channel_id, subject, created_at) VALUES (?, ?, ?, ?, ?)`,
 		recipientID, installationID, channelID, subject, now.Unix()); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
+	err = tx.Commit()
+	if err != nil {
 		return nil, err
 	}
 	return &Binding{RecipientID: recipientID, InstallationID: installationID, ChannelID: channelID, Subject: subject, CreatedAt: now}, nil
@@ -449,7 +455,8 @@ func (s *Store) ResolveRecipients(ctx context.Context, channelID string, ids []s
 	var out []Recipient
 	for rows.Next() {
 		var r Recipient
-		if err := rows.Scan(&r.RecipientID, &r.InstallationID, &r.Platform, &r.APNSEnvironment, &r.DeviceTokenEnc); err != nil {
+		err = rows.Scan(&r.RecipientID, &r.InstallationID, &r.Platform, &r.APNSEnvironment, &r.DeviceTokenEnc)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -500,8 +507,8 @@ func (s *Store) EnqueueEvent(ctx context.Context, channelID, eventID, collapseID
 	}
 	defer func() { _ = tx.Rollback() }()
 	now := s.now().Unix()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO events(channel_id, event_id, received_at) VALUES (?, ?, ?)`, channelID, eventID, now); err != nil {
-		if isUniqueViolation(err) {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO events(channel_id, event_id, received_at) VALUES (?, ?, ?)`, channelID, eventID, now); err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			return ErrConflict
 		}
 		return err
@@ -513,20 +520,18 @@ func (s *Store) EnqueueEvent(ctx context.Context, channelID, eventID, collapseID
 	}
 	defer func() { _ = stmt.Close() }()
 	for _, d := range deliveries {
-		if _, err := stmt.ExecContext(ctx, channelID, eventID, d.RecipientID, d.InstallationID, collapseID, d.Payload, DeliveryPending, now, now, now); err != nil {
+		if _, err = stmt.ExecContext(ctx, channelID, eventID, d.RecipientID, d.InstallationID, collapseID, d.Payload, DeliveryPending, now, now, now); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// ClaimDue locks up to limit due deliveries for lease and returns them.
-func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([]Delivery, error) {
-	now := s.now()
-	rows, err := s.db.QueryContext(ctx, `UPDATE deliveries SET locked_until = ?
-		WHERE id IN (SELECT id FROM deliveries WHERE status = ? AND next_attempt_at <= ? AND locked_until < ? ORDER BY next_attempt_at, id LIMIT ?)
-		RETURNING id, channel_id, event_id, recipient_id, installation_id, collapse_id, payload, status, attempts, next_attempt_at, COALESCE(last_error, ''), created_at, updated_at`,
-		now.Add(lease).Unix(), DeliveryPending, now.Unix(), now.Unix(), limit)
+const deliveryColumns = `id, channel_id, event_id, recipient_id, installation_id, collapse_id, payload, status, attempts, next_attempt_at,
+	COALESCE(last_error, ''), created_at, updated_at`
+
+func (s *Store) queryDeliveries(ctx context.Context, query string, args ...any) ([]Delivery, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -535,7 +540,8 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([
 	for rows.Next() {
 		var d Delivery
 		var next, created, updated int64
-		if err := rows.Scan(&d.ID, &d.ChannelID, &d.EventID, &d.RecipientID, &d.InstallationID, &d.CollapseID, &d.Payload, &d.Status, &d.Attempts, &next, &d.LastError, &created, &updated); err != nil {
+		err = rows.Scan(&d.ID, &d.ChannelID, &d.EventID, &d.RecipientID, &d.InstallationID, &d.CollapseID, &d.Payload, &d.Status, &d.Attempts, &next, &d.LastError, &created, &updated)
+		if err != nil {
 			return nil, err
 		}
 		d.NextAttemptAt, d.CreatedAt, d.UpdatedAt = time.Unix(next, 0), time.Unix(created, 0), time.Unix(updated, 0)
@@ -544,58 +550,51 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([
 	return out, rows.Err()
 }
 
+// ClaimDue locks up to limit due deliveries for lease and returns them.
+func (s *Store) ClaimDue(ctx context.Context, limit int, lease time.Duration) ([]Delivery, error) {
+	now := s.now()
+	return s.queryDeliveries(ctx, `UPDATE deliveries SET locked_until = ?
+		WHERE id IN (SELECT id FROM deliveries WHERE status = ? AND next_attempt_at <= ? AND locked_until < ? ORDER BY next_attempt_at, id LIMIT ?)
+		RETURNING `+deliveryColumns,
+		now.Add(lease).Unix(), DeliveryPending, now.Unix(), now.Unix(), limit)
+}
+
 // MarkSent finalizes a delivery as accepted by APNs and discards the payload.
 func (s *Store) MarkSent(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE deliveries SET status = ?, payload = NULL, attempts = attempts + 1, locked_until = 0, last_error = NULL, updated_at = ? WHERE id = ?`, DeliverySent, s.now().Unix(), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE deliveries SET status = ?, payload = NULL, attempts = attempts + 1, locked_until = 0, last_error = NULL, updated_at = ? WHERE id = ?`,
+		DeliverySent, s.now().Unix(), id)
 	return err
 }
 
 // MarkRetry schedules another attempt.
 func (s *Store) MarkRetry(ctx context.Context, id int64, next time.Time, reason string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE deliveries SET attempts = attempts + 1, next_attempt_at = ?, locked_until = 0, last_error = ?, updated_at = ? WHERE id = ?`, next.Unix(), reason, s.now().Unix(), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE deliveries SET attempts = attempts + 1, next_attempt_at = ?, locked_until = 0, last_error = ?, updated_at = ? WHERE id = ?`,
+		next.Unix(), reason, s.now().Unix(), id)
 	return err
 }
 
 // MarkTerminal ends a delivery with a final status (failed/dropped) and discards the payload.
 func (s *Store) MarkTerminal(ctx context.Context, id int64, status, reason string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE deliveries SET status = ?, payload = NULL, attempts = attempts + 1, locked_until = 0, last_error = ?, updated_at = ? WHERE id = ?`, status, reason, s.now().Unix(), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE deliveries SET status = ?, payload = NULL, attempts = attempts + 1, locked_until = 0, last_error = ?, updated_at = ? WHERE id = ?`,
+		status, reason, s.now().Unix(), id)
 	return err
 }
 
 // GetDelivery loads one delivery (tests and diagnostics).
 func (s *Store) GetDelivery(ctx context.Context, id int64) (*Delivery, error) {
-	var d Delivery
-	var next, created, updated int64
-	err := s.db.QueryRowContext(ctx, `SELECT id, channel_id, event_id, recipient_id, installation_id, collapse_id, payload, status, attempts, next_attempt_at, COALESCE(last_error, ''), created_at, updated_at FROM deliveries WHERE id = ?`, id).
-		Scan(&d.ID, &d.ChannelID, &d.EventID, &d.RecipientID, &d.InstallationID, &d.CollapseID, &d.Payload, &d.Status, &d.Attempts, &next, &d.LastError, &created, &updated)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
+	ds, err := s.queryDeliveries(ctx, `SELECT `+deliveryColumns+` FROM deliveries WHERE id = ?`, id)
 	if err != nil {
 		return nil, err
 	}
-	d.NextAttemptAt, d.CreatedAt, d.UpdatedAt = time.Unix(next, 0), time.Unix(created, 0), time.Unix(updated, 0)
-	return &d, nil
+	if len(ds) == 0 {
+		return nil, ErrNotFound
+	}
+	return &ds[0], nil
 }
 
 // ListDeliveriesByEvent returns deliveries for an event (tests and diagnostics).
 func (s *Store) ListDeliveriesByEvent(ctx context.Context, channelID, eventID string) ([]Delivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, channel_id, event_id, recipient_id, installation_id, collapse_id, payload, status, attempts, next_attempt_at, COALESCE(last_error, ''), created_at, updated_at FROM deliveries WHERE channel_id = ? AND event_id = ? ORDER BY id`, channelID, eventID)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Delivery
-	for rows.Next() {
-		var d Delivery
-		var next, created, updated int64
-		if err := rows.Scan(&d.ID, &d.ChannelID, &d.EventID, &d.RecipientID, &d.InstallationID, &d.CollapseID, &d.Payload, &d.Status, &d.Attempts, &next, &d.LastError, &created, &updated); err != nil {
-			return nil, err
-		}
-		d.NextAttemptAt, d.CreatedAt, d.UpdatedAt = time.Unix(next, 0), time.Unix(created, 0), time.Unix(updated, 0)
-		out = append(out, d)
-	}
-	return out, rows.Err()
+	return s.queryDeliveries(ctx, `SELECT `+deliveryColumns+` FROM deliveries WHERE channel_id = ? AND event_id = ? ORDER BY id`, channelID, eventID)
 }
 
 // CountPending returns the number of pending deliveries (health/metrics).
@@ -619,8 +618,4 @@ func (s *Store) Prune(ctx context.Context, retention time.Duration) error {
 		return err
 	}
 	return nil
-}
-
-func isUniqueViolation(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }

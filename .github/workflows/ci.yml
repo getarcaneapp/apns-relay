@@ -43,7 +43,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           version: latest
-          args: --config=.github/.golangci.yml
+          args: --config=.golangci.yml
 
   goreleaser-check:
     name: GoReleaser Config

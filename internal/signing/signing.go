@@ -6,6 +6,7 @@
 package signing
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/mldsa"
 	"encoding/base64"
@@ -171,9 +172,9 @@ func SplitPairingToken(token string) (PairingClaims, []byte, []byte, error) {
 		return PairingClaims{}, nil, nil, ErrBadToken
 	}
 	var claims PairingClaims
-	dec := json.NewDecoder(strings.NewReader(string(payload)))
+	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&claims); err != nil {
+	if err = dec.Decode(&claims); err != nil {
 		return PairingClaims{}, nil, nil, fmt.Errorf("%w: %w", ErrBadToken, err)
 	}
 	if claims.ChannelID == "" || claims.Subject == "" || claims.Nonce == "" || claims.ExpiresAt == 0 {

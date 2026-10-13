@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -18,9 +19,7 @@ func env(overrides map[string]string) func(string) string {
 		"RELAY_ENCRYPTION_KEY": hex.EncodeToString(make([]byte, 32)),
 		"APNS_MODE":            "log",
 	}
-	for k, v := range overrides {
-		base[k] = v
-	}
+	maps.Copy(base, overrides)
 	return func(k string) string { return base[k] }
 }
 

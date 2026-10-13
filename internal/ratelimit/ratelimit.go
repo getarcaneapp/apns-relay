@@ -40,10 +40,7 @@ func (l *Limiter) Allow(key string) bool {
 	}
 	elapsed := now.Sub(b.lastSeen)
 	b.lastSeen = now
-	b.tokens += elapsed.Seconds() * (l.limit / l.window.Seconds())
-	if b.tokens > l.limit {
-		b.tokens = l.limit
-	}
+	b.tokens = min(b.tokens+elapsed.Seconds()*(l.limit/l.window.Seconds()), l.limit)
 	if b.tokens < 1 {
 		return false
 	}
