@@ -110,3 +110,49 @@ func TestPayloadStaysUnderLimitAtMaxLengths(t *testing.T) {
 		t.Fatalf("payload %d bytes exceeds limit", len(p))
 	}
 }
+
+func TestDedupeKeyIgnoresEventIDButNotContent(t *testing.T) {
+	now := time.Now()
+	a, b := valid(now), valid(now.Add(time.Hour))
+	b.EventID = "evt-2"
+	if DedupeKey(&a) != DedupeKey(&b) {
+		t.Fatal("repeats of the same alert should share a dedupe key")
+	}
+	if len(DedupeKey(&a)) > MaxEventIDLen {
+		t.Fatalf("dedupe key %q exceeds the apns-collapse-id limit", DedupeKey(&a))
+	}
+	b.Body = "web was updated to nginx:1.28"
+	if DedupeKey(&a) == DedupeKey(&b) {
+		t.Fatal("different alerts must not share a dedupe key")
+	}
+	c := valid(now)
+	c.ChannelID = "ch_2"
+	if DedupeKey(&a) == DedupeKey(&c) {
+		t.Fatal("alerts from different servers must not share a dedupe key")
+	}
+}
+
+func TestPayloadGroupsByEnvironmentAndType(t *testing.T) {
+	e := valid(time.Now())
+	raw, err := BuildAPNSPayload(&e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p APNSPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.APS.ThreadID != "env-1:container_update" {
+		t.Fatalf("thread-id = %q", p.APS.ThreadID)
+	}
+	if p.APS.MutableContent != 1 {
+		t.Fatal("mutable-content must be set for the notification service extension")
+	}
+	if p.Arcane.DedupeKey != DedupeKey(&e) {
+		t.Fatal("payload must carry the dedupe key")
+	}
+	e.EnvironmentID = ""
+	if ThreadID(&e) != "container_update" {
+		t.Fatalf("thread-id without environment = %q", ThreadID(&e))
+	}
+}

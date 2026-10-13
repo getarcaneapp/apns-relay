@@ -250,7 +250,8 @@ func TestFullFlow(t *testing.T) {
 				t.Fatalf("expected 1 send, got %d", h.apns.sent.Load())
 			}
 			n := h.apns.last.Load().(apns.Notification)
-			if n.DeviceToken != strings.Repeat("ab", 32) || n.Environment != apns.EnvironmentSandbox || n.CollapseID != "evt-1" {
+			if n.DeviceToken != strings.Repeat("ab", 32) || n.Environment != apns.EnvironmentSandbox ||
+				!strings.HasPrefix(n.CollapseID, "d-") || len(n.CollapseID) > 64 {
 				t.Fatalf("unexpected notification: %+v", n)
 			}
 			if strings.Contains(string(n.Payload), d.recipient) {

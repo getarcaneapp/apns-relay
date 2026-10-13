@@ -2,6 +2,8 @@
 package envelope
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -246,6 +248,9 @@ type APS struct {
 	Sound             string    `json:"sound,omitempty"`
 	ThreadID          string    `json:"thread-id,omitempty"`
 	InterruptionLevel string    `json:"interruption-level,omitempty"`
+	// MutableContent lets the app's notification service extension dedupe
+	// and roll up alerts before they are shown.
+	MutableContent int `json:"mutable-content,omitempty"`
 }
 
 // ArcaneData is the custom portion the app uses for routing.
@@ -260,12 +265,39 @@ type ArcaneData struct {
 	Resource        *Resource `json:"resource,omitempty"`
 	Route           Route     `json:"route"`
 	ChannelID       string    `json:"channelId"`
+	DedupeKey       string    `json:"dedupeKey"`
 }
 
 // APNSPayload is the full push payload.
 type APNSPayload struct {
 	APS    APS        `json:"aps"`
 	Arcane ArcaneData `json:"arcane"`
+}
+
+// DedupeKey identifies an alert by what it says rather than by its event id,
+// which the manager generates fresh for every send. Repeats of the same alert
+// share a key, so it doubles as the apns-collapse-id (at most 64 bytes) and
+// replaces the copy already on the device instead of stacking a new one.
+func DedupeKey(e *Envelope) string {
+	h := sha256.New()
+	parts := []string{e.ChannelID, e.Type, e.EnvironmentID, e.Title, e.Body}
+	if e.Resource != nil {
+		parts = append(parts, e.Resource.Kind, e.Resource.ID)
+	}
+	for _, part := range parts {
+		h.Write([]byte(part))
+		h.Write([]byte{0})
+	}
+	return "d-" + hex.EncodeToString(h.Sum(nil))[:40]
+}
+
+// ThreadID groups notifications per environment and event type, so image
+// updates, vulnerabilities, and restarts stack separately.
+func ThreadID(e *Envelope) string {
+	if e.EnvironmentID == "" {
+		return e.Type
+	}
+	return e.EnvironmentID + ":" + e.Type
 }
 
 // BuildAPNSPayload projects the envelope into a compact alert payload.
@@ -275,8 +307,9 @@ func BuildAPNSPayload(e *Envelope) ([]byte, error) {
 		APS: APS{
 			Alert:             APNSAlert{Title: e.Title, Body: e.Body},
 			Sound:             "default",
-			ThreadID:          e.EnvironmentID,
+			ThreadID:          ThreadID(e),
 			InterruptionLevel: "active",
+			MutableContent:    1,
 		},
 		Arcane: ArcaneData{
 			Version:         Version,
@@ -289,6 +322,7 @@ func BuildAPNSPayload(e *Envelope) ([]byte, error) {
 			Resource:        e.Resource,
 			Route:           e.Route,
 			ChannelID:       e.ChannelID,
+			DedupeKey:       DedupeKey(e),
 		},
 	}
 	b, err := json.Marshal(p)

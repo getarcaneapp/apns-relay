@@ -667,7 +667,7 @@ func (s *Server) enqueue(w http.ResponseWriter, r *http.Request, ch *store.Chann
 			unknown = append(unknown, id)
 		}
 	}
-	if err := s.store.EnqueueEvent(r.Context(), ch.ID, env.EventID, env.EventID, deliveries); err != nil {
+	if err := s.store.EnqueueEvent(r.Context(), ch.ID, env.EventID, envelope.DedupeKey(env), deliveries); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			s.metrics.EventsDuplicate.Add(1)
 			writeJSON(w, http.StatusOK, map[string]any{"eventId": env.EventID, "duplicate": true, "queued": 0, "unknownRecipientIds": []string{}})
