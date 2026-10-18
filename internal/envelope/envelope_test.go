@@ -156,3 +156,66 @@ func TestPayloadGroupsByEnvironmentAndType(t *testing.T) {
 		t.Fatalf("thread-id without environment = %q", ThreadID(&e))
 	}
 }
+
+func TestFCMPayloadMatchesAPNSPayload(t *testing.T) {
+	e := valid(time.Now())
+	raw, err := BuildFCMPayload(&e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "rcp_") {
+		t.Fatal("payload must not contain recipient ids")
+	}
+	var p FCMPayload
+	if err = json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	// FCM data values must all be strings.
+	var data map[string]any
+	if err = json.Unmarshal(raw, &struct {
+		Data *map[string]any `json:"data"`
+	}{&data}); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range data {
+		if _, ok := v.(string); !ok {
+			t.Fatalf("data[%q] is %T, want string", k, v)
+		}
+	}
+	apnsRaw, _ := BuildAPNSPayload(&e)
+	var ap APNSPayload
+	_ = json.Unmarshal(apnsRaw, &ap)
+	var body FCMBody
+	if err = json.Unmarshal([]byte(p.Data.Body), &body); err != nil {
+		t.Fatalf("body must be a JSON object string: %v", err)
+	}
+	arcane := body.Arcane
+	if p.Data.Title != e.Title || p.Data.Message != e.Body || p.Data.ChannelID != AndroidChannelID ||
+		p.Data.ThreadIdentifier != ap.APS.ThreadID || p.Data.Tag != ap.Arcane.DedupeKey ||
+		arcane.EventID != e.EventID || arcane.DedupeKey != DedupeKey(&e) || arcane.Route != e.Route {
+		t.Fatalf("unexpected FCM payload: %s", raw)
+	}
+}
+
+func TestFCMPayloadStaysUnderLimitAtMaxLengths(t *testing.T) {
+	now := time.Now()
+	e := valid(now)
+	e.Title = strings.Repeat("T", MaxTitleLen)
+	e.Body = strings.Repeat("B", MaxBodyLen)
+	e.EnvironmentName = strings.Repeat("E", MaxEnvironmentNameLen)
+	e.Resource = &Resource{Kind: strings.Repeat("k", 32), ID: strings.Repeat("i", MaxResourceIDLen), Name: strings.Repeat("n", MaxResourceNameLen)}
+	e.EnvironmentID = strings.Repeat("v", 128)
+	e.Route = Route{Kind: RouteImage, EnvironmentID: strings.Repeat("v", 128), ID: strings.Repeat("i", 128)}
+	e.ChannelID = strings.Repeat("c", 128)
+	e.EventID = strings.Repeat("e", 64)
+	if err := e.Validate(now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildFCMPayload(&e); err != nil {
+		t.Fatal(err)
+	}
+	e.Body = strings.Repeat("B", MaxFCMPayloadBytes)
+	if _, err := BuildFCMPayload(&e); !errors.Is(err, ErrPayloadLimit) {
+		t.Fatalf("expected ErrPayloadLimit, got %v", err)
+	}
+}

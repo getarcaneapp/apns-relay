@@ -7,9 +7,11 @@ import (
 	"bytes"
 	"cmp"
 	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -39,6 +41,11 @@ const (
 	APNSSandboxURL = "https://api.sandbox.push.apple.com"
 	// APNSProductionURL is Apple's production APNs host.
 	APNSProductionURL = "https://api.push.apple.com"
+
+	// FCMTokenURL is Google's OAuth2 token endpoint for service accounts.
+	FCMTokenURL = "https://oauth2.googleapis.com/token"
+	// FCMBaseURL is the FCM HTTP v1 API host.
+	FCMBaseURL = "https://fcm.googleapis.com"
 )
 
 // APNSMode controls how deliveries leave the relay.
@@ -49,6 +56,18 @@ const (
 	APNSModeLive APNSMode = "live"
 	// APNSModeLog logs deliveries instead of sending them (local development only).
 	APNSModeLog APNSMode = "log"
+)
+
+// FCMMode controls whether and how Android deliveries leave the relay.
+type FCMMode string
+
+const (
+	// FCMModeDisabled rejects FCM installations (the default).
+	FCMModeDisabled FCMMode = "disabled"
+	// FCMModeLive sends to Google.
+	FCMModeLive FCMMode = "live"
+	// FCMModeLog logs deliveries instead of sending them (local development only).
+	FCMModeLog FCMMode = "log"
 )
 
 // File is the YAML schema. All fields are optional; unset fields keep defaults.
@@ -82,6 +101,14 @@ type File struct {
 		SandboxURL    string `yaml:"sandbox_url"`
 		ProductionURL string `yaml:"production_url"`
 	} `yaml:"apns"`
+	FCM struct {
+		Mode               string `yaml:"mode"`
+		ProjectID          string `yaml:"project_id"`
+		ServiceAccount     string `yaml:"service_account"`
+		ServiceAccountFile string `yaml:"service_account_file"`
+		TokenURL           string `yaml:"token_url"`
+		BaseURL            string `yaml:"base_url"`
+	} `yaml:"fcm"`
 }
 
 // APNS holds Apple Push Notification service credentials.
@@ -94,6 +121,22 @@ type APNS struct {
 	SandboxURL    string
 	ProductionURL string
 }
+
+// FCM holds Firebase Cloud Messaging service-account credentials.
+type FCM struct {
+	Mode        FCMMode
+	ProjectID   string
+	ClientEmail string
+	PrivateKey  *rsa.PrivateKey
+	// TokenURL is where access tokens are fetched; overriding it (e.g. for a test
+	// server) leaves TokenAudience, the service account's token_uri, unchanged.
+	TokenURL      string
+	TokenAudience string
+	BaseURL       string
+}
+
+// Enabled reports whether the relay accepts and delivers to FCM installations.
+func (f FCM) Enabled() bool { return f.Mode != FCMModeDisabled }
 
 // RateLimits are token-bucket parameters per minute.
 type RateLimits struct {
@@ -117,6 +160,7 @@ type Config struct {
 	LogFormat         string
 	RateLimits        RateLimits
 	APNS              APNS
+	FCM               FCM
 }
 
 // Load reads the YAML file at path (if non-empty) and applies environment overrides.
@@ -151,7 +195,7 @@ func ParseFile(b []byte) (*File, error) {
 }
 
 // resolve merges defaults, file and env. Env variable names mirror YAML keys with a
-// RELAY_ prefix (APNS_ prefix for the apns block).
+// RELAY_ prefix (APNS_ and FCM_ prefixes for the apns and fcm blocks).
 func resolve(f File, getenv func(string) string, readFile func(string) ([]byte, error)) (*Config, error) {
 	str := func(env, fileVal, def string) string {
 		return cmp.Or(strings.TrimSpace(getenv(env)), strings.TrimSpace(fileVal), def)
@@ -178,6 +222,10 @@ func resolve(f File, getenv func(string) string, readFile func(string) ([]byte, 
 			Topic:         str("APNS_TOPIC", f.APNS.Topic, DefaultAPNSTopic),
 			SandboxURL:    str("APNS_SANDBOX_URL", f.APNS.SandboxURL, APNSSandboxURL),
 			ProductionURL: str("APNS_PRODUCTION_URL", f.APNS.ProductionURL, APNSProductionURL),
+		},
+		FCM: FCM{
+			Mode:    FCMMode(str("FCM_MODE", f.FCM.Mode, string(FCMModeDisabled))),
+			BaseURL: str("FCM_BASE_URL", f.FCM.BaseURL, FCMBaseURL),
 		},
 	}
 
@@ -260,6 +308,34 @@ func resolve(f File, getenv func(string) string, readFile func(string) ([]byte, 
 	if cfg.APNS.Topic == "" {
 		failf("apns.topic must not be empty")
 	}
+
+	switch cfg.FCM.Mode {
+	case FCMModeLive:
+		var sa *ServiceAccount
+		saJSON, err := secretValue(getenv, readFile, "FCM_SERVICE_ACCOUNT_JSON", "FCM_SERVICE_ACCOUNT_FILE", f.FCM.ServiceAccount, f.FCM.ServiceAccountFile)
+		switch {
+		case err != nil:
+			failf("fcm.service_account_file / FCM_SERVICE_ACCOUNT_FILE: %w", err)
+		case saJSON == "":
+			failf("fcm.service_account / fcm.service_account_file (or FCM_SERVICE_ACCOUNT_JSON / FCM_SERVICE_ACCOUNT_FILE) is required")
+		default:
+			if sa, err = ParseServiceAccount([]byte(saJSON)); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if sa != nil {
+			cfg.FCM.ClientEmail, cfg.FCM.PrivateKey = sa.ClientEmail, sa.PrivateKey
+			cfg.FCM.ProjectID = str("FCM_PROJECT_ID", f.FCM.ProjectID, sa.ProjectID)
+			cfg.FCM.TokenAudience = cmp.Or(sa.TokenURI, FCMTokenURL)
+			cfg.FCM.TokenURL = str("FCM_TOKEN_URL", f.FCM.TokenURL, cfg.FCM.TokenAudience)
+			if cfg.FCM.ProjectID == "" {
+				failf("fcm.project_id / FCM_PROJECT_ID is required (the service account has no project_id)")
+			}
+		}
+	case FCMModeLog, FCMModeDisabled:
+	default:
+		failf("fcm.mode: must be %q, %q or %q", FCMModeDisabled, FCMModeLive, FCMModeLog)
+	}
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
@@ -334,4 +410,45 @@ func ParseP8(pemBytes []byte) (*ecdsa.PrivateKey, error) {
 		return nil, errors.New("APNs key: not an ECDSA private key (APNs requires ES256 / P-256)")
 	}
 	return pk, nil
+}
+
+// ServiceAccount is the subset of a Google service-account JSON key the relay needs.
+type ServiceAccount struct {
+	ProjectID   string
+	ClientEmail string
+	TokenURI    string
+	PrivateKey  *rsa.PrivateKey
+}
+
+// ParseServiceAccount parses a Google service-account JSON key file.
+func ParseServiceAccount(b []byte) (*ServiceAccount, error) {
+	var raw struct {
+		Type        string `json:"type"`
+		ProjectID   string `json:"project_id"`
+		ClientEmail string `json:"client_email"`
+		PrivateKey  string `json:"private_key"`
+		TokenURI    string `json:"token_uri"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("FCM service account: invalid JSON: %w", err)
+	}
+	if raw.Type != "" && raw.Type != "service_account" {
+		return nil, fmt.Errorf("FCM service account: type is %q, want service_account", raw.Type)
+	}
+	if raw.ClientEmail == "" {
+		return nil, errors.New("FCM service account: client_email is missing")
+	}
+	block, _ := pem.Decode([]byte(raw.PrivateKey))
+	if block == nil {
+		return nil, errors.New("FCM service account: private_key has no PEM block")
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("FCM service account: %w", err)
+	}
+	pk, ok := parsed.(*rsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("FCM service account: private_key is not an RSA key")
+	}
+	return &ServiceAccount{ProjectID: raw.ProjectID, ClientEmail: raw.ClientEmail, TokenURI: raw.TokenURI, PrivateKey: pk}, nil
 }

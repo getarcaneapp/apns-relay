@@ -22,22 +22,28 @@ import (
 	"github.com/getarcaneapp/apns-relay/internal/config"
 	"github.com/getarcaneapp/apns-relay/internal/envelope"
 	"github.com/getarcaneapp/apns-relay/internal/metrics"
+	"github.com/getarcaneapp/apns-relay/internal/push"
 	"github.com/getarcaneapp/apns-relay/internal/ratelimit"
 	"github.com/getarcaneapp/apns-relay/internal/secrets"
 	"github.com/getarcaneapp/apns-relay/internal/signing"
 	"github.com/getarcaneapp/apns-relay/internal/store"
 )
 
-// PlatformAPNS is the only platform accepted today; the schema also reserves "fcm".
-const PlatformAPNS = "apns"
-
 const (
 	maxAppVersionLen  = 64
 	maxSubjectLen     = 128
 	controlRequestAge = 5 * time.Minute
+
+	// FCM registration tokens are ~160 characters today; Google documents no
+	// fixed length, so allow generous headroom.
+	minFCMTokenLen = 64
+	maxFCMTokenLen = 4096
 )
 
-var deviceTokenPattern = regexp.MustCompile(`^[0-9a-fA-F]{32,400}$`)
+var (
+	apnsTokenPattern = regexp.MustCompile(`^[0-9a-fA-F]{32,400}$`)
+	fcmTokenPattern  = regexp.MustCompile(`^[A-Za-z0-9_:-]+$`)
+)
 
 // Options wires the server's collaborators.
 type Options struct {
@@ -414,20 +420,33 @@ type createInstallationRequest struct {
 	AppVersion      string `json:"appVersion"`
 }
 
-func validateInstallationFields(platform, env, token, appVersion string) error {
-	if platform != "" && platform != PlatformAPNS {
-		return fmt.Errorf("platform %q is not supported", platform)
-	}
-	if env != "" && !apns.ValidEnvironment(env) {
-		return errors.New("apnsEnvironment must be sandbox or production")
-	}
-	if !deviceTokenPattern.MatchString(token) {
-		return errors.New("deviceToken must be a hex string")
-	}
+// validateInstallationFields checks the fields for the given platform and returns
+// the device token in the form it is stored: APNs tokens are lowercased hex, FCM
+// tokens are case-sensitive and kept as-is.
+func (s *Server) validateInstallationFields(platform, env, token, appVersion string) (string, error) {
 	if len(appVersion) > maxAppVersionLen {
-		return errors.New("appVersion is too long")
+		return "", errors.New("appVersion is too long")
 	}
-	return nil
+	switch {
+	case platform == push.PlatformAPNS:
+		if env != "" && !apns.ValidEnvironment(env) {
+			return "", errors.New("apnsEnvironment must be sandbox or production")
+		}
+		if !apnsTokenPattern.MatchString(token) {
+			return "", errors.New("deviceToken must be a hex string")
+		}
+		return strings.ToLower(token), nil
+	case platform == push.PlatformFCM && s.cfg.FCM.Enabled():
+		if env != "" {
+			return "", errors.New("apnsEnvironment is not allowed for fcm installations")
+		}
+		if len(token) < minFCMTokenLen || len(token) > maxFCMTokenLen || !fcmTokenPattern.MatchString(token) {
+			return "", errors.New("deviceToken is not a valid FCM registration token")
+		}
+		return token, nil
+	default:
+		return "", fmt.Errorf("platform %q is not supported", platform)
+	}
 }
 
 func (s *Server) handleCreateInstallation(w http.ResponseWriter, r *http.Request) {
@@ -443,18 +462,19 @@ func (s *Server) handleCreateInstallation(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON: "+err.Error())
 		return
 	}
-	req.Platform = cmp.Or(req.Platform, PlatformAPNS)
-	if req.APNSEnvironment == "" {
+	req.Platform = cmp.Or(req.Platform, push.PlatformAPNS)
+	if req.Platform == push.PlatformAPNS && req.APNSEnvironment == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "apnsEnvironment is required")
 		return
 	}
-	if err := validateInstallationFields(req.Platform, req.APNSEnvironment, req.DeviceToken, req.AppVersion); err != nil {
+	token, err := s.validateInstallationFields(req.Platform, req.APNSEnvironment, req.DeviceToken, req.AppVersion)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 	id := secrets.NewID("ins_")
 	secret := secrets.NewSecret()
-	tokenEnc, err := s.sealer.Seal([]byte(strings.ToLower(req.DeviceToken)), []byte(id))
+	tokenEnc, err := s.sealer.Seal([]byte(token), []byte(id))
 	if err != nil {
 		s.internal(w, r, "seal token", err)
 		return
@@ -494,11 +514,12 @@ func (s *Server) handleUpdateToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON: "+err.Error())
 		return
 	}
-	if err := validateInstallationFields("", req.APNSEnvironment, req.DeviceToken, req.AppVersion); err != nil {
+	token, err := s.validateInstallationFields(in.Platform, req.APNSEnvironment, req.DeviceToken, req.AppVersion)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	tokenEnc, err := s.sealer.Seal([]byte(strings.ToLower(req.DeviceToken)), []byte(in.ID))
+	tokenEnc, err := s.sealer.Seal([]byte(token), []byte(in.ID))
 	if err != nil {
 		s.internal(w, r, "seal token", err)
 		return
@@ -620,11 +641,19 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) enqueue(w http.ResponseWriter, r *http.Request, ch *store.Channel, env *envelope.Envelope) {
-	payload, err := envelope.BuildAPNSPayload(env)
-	if err != nil {
-		s.metrics.EventsRejected.Add(1)
-		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", err.Error())
-		return
+	payloads := make(map[string][]byte, 2)
+	builders := map[string]func(*envelope.Envelope) ([]byte, error){push.PlatformAPNS: envelope.BuildAPNSPayload}
+	if s.cfg.FCM.Enabled() {
+		builders[push.PlatformFCM] = envelope.BuildFCMPayload
+	}
+	for platform, build := range builders {
+		payload, err := build(env)
+		if err != nil {
+			s.metrics.EventsRejected.Add(1)
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", err.Error())
+			return
+		}
+		payloads[platform] = payload
 	}
 	recipients, err := s.store.ResolveRecipients(r.Context(), ch.ID, env.RecipientIDs)
 	if err != nil {
@@ -633,8 +662,15 @@ func (s *Server) enqueue(w http.ResponseWriter, r *http.Request, ch *store.Chann
 	}
 	known := make(map[string]bool, len(recipients))
 	deliveries := make([]store.NewDelivery, 0, len(recipients))
+	skipped := 0
 	for _, rc := range recipients {
 		known[rc.RecipientID] = true
+		payload, ok := payloads[rc.Platform]
+		if !ok {
+			// Installations left over from when FCM was enabled; nothing can deliver them.
+			skipped++
+			continue
+		}
 		deliveries = append(deliveries, store.NewDelivery{RecipientID: rc.RecipientID, InstallationID: rc.InstallationID, Payload: payload})
 	}
 	unknown := make([]string, 0)
@@ -659,6 +695,7 @@ func (s *Server) enqueue(w http.ResponseWriter, r *http.Request, ch *store.Chann
 		"eventId", env.EventID,
 		"type", env.Type,
 		"queued", len(deliveries),
+		"skippedDisabledPlatform", skipped,
 		"unknownRecipients", len(unknown))
 	if len(deliveries) > 0 {
 		s.wake()

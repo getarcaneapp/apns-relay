@@ -1,4 +1,4 @@
-// Package worker drains the delivery queue to APNs.
+// Package worker drains the delivery queue to APNs and FCM.
 package worker
 
 import (
@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/getarcaneapp/apns-relay/internal/apns"
 	"github.com/getarcaneapp/apns-relay/internal/metrics"
+	"github.com/getarcaneapp/apns-relay/internal/push"
 	"github.com/getarcaneapp/apns-relay/internal/secrets"
 	"github.com/getarcaneapp/apns-relay/internal/store"
 )
@@ -21,7 +21,7 @@ import (
 // Options configures the worker.
 type Options struct {
 	Store        *store.Store
-	Sender       apns.Sender
+	Senders      map[string]push.Sender // keyed by installation platform
 	Sealer       *secrets.Sealer
 	Metrics      *metrics.Registry
 	Logger       *slog.Logger
@@ -149,6 +149,11 @@ func (w *Worker) process(ctx context.Context, d store.Delivery) {
 		w.retry(ctx, d, "load installation: "+err.Error(), log)
 		return
 	}
+	sender, ok := w.o.Senders[in.Platform]
+	if !ok {
+		w.terminal(ctx, d, store.DeliveryFailed, fmt.Sprintf("platform %s not configured", in.Platform), log)
+		return
+	}
 	token, err := w.o.Sealer.Open(in.DeviceTokenEnc, []byte(in.ID))
 	if err != nil {
 		w.terminal(ctx, d, store.DeliveryFailed, "cannot decrypt device token", log)
@@ -156,9 +161,9 @@ func (w *Worker) process(ctx context.Context, d store.Delivery) {
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	res, err := w.o.Sender.Send(sendCtx, apns.Notification{
+	res, err := sender.Send(sendCtx, push.Notification{
 		DeviceToken: string(token),
-		Environment: apns.Environment(in.APNSEnvironment),
+		Environment: in.APNSEnvironment,
 		Payload:     d.Payload,
 		CollapseID:  d.CollapseID,
 		Expiration:  w.o.Now().Add(24 * time.Hour),
@@ -167,28 +172,28 @@ func (w *Worker) process(ctx context.Context, d store.Delivery) {
 		w.retry(ctx, d, "transport: "+err.Error(), log)
 		return
 	}
-	w.o.Metrics.ObserveAPNSStatus(res.StatusCode, res.Reason)
-	apnsReason := fmt.Sprintf("apns %d %s", res.StatusCode, res.Reason)
+	w.o.Metrics.ObservePushStatus(in.Platform, res.StatusCode, res.Reason)
+	pushReason := fmt.Sprintf("%s %d %s", in.Platform, res.StatusCode, res.Reason)
 	switch res.Outcome {
-	case apns.OutcomeSent:
+	case push.OutcomeSent:
 		if err = w.o.Store.MarkSent(ctx, d.ID); err != nil {
 			log.ErrorContext(ctx, "mark sent failed", "error", err)
 			return
 		}
 		w.o.Metrics.DeliveriesSent.Add(1)
-		log.InfoContext(ctx, "delivered", "apnsId", res.APNSID, "environment", in.APNSEnvironment)
-	case apns.OutcomeRetry:
-		w.retry(ctx, d, apnsReason, log)
-	case apns.OutcomeInvalidToken:
+		log.InfoContext(ctx, "delivered", "platform", in.Platform, "messageId", res.ID, "environment", in.APNSEnvironment)
+	case push.OutcomeRetry:
+		w.retry(ctx, d, pushReason, log)
+	case push.OutcomeInvalidToken:
 		if err = w.o.Store.DeleteInstallation(ctx, in.ID); err != nil && !errors.Is(err, store.ErrNotFound) {
 			log.ErrorContext(ctx, "remove installation failed", "error", err)
 		} else {
 			w.o.Metrics.InvalidTokenRemoved.Add(1)
 		}
-		w.terminal(ctx, d, store.DeliveryDropped, apnsReason, log)
+		w.terminal(ctx, d, store.DeliveryDropped, pushReason, log)
 		log.InfoContext(ctx, "installation removed after invalid token", "installationId", in.ID, "reason", res.Reason)
-	case apns.OutcomeFailed:
-		w.terminal(ctx, d, store.DeliveryFailed, apnsReason, log)
+	case push.OutcomeFailed:
+		w.terminal(ctx, d, store.DeliveryFailed, pushReason, log)
 	}
 }
 

@@ -16,7 +16,9 @@ import (
 
 	"github.com/getarcaneapp/apns-relay/internal/apns"
 	"github.com/getarcaneapp/apns-relay/internal/config"
+	"github.com/getarcaneapp/apns-relay/internal/fcm"
 	"github.com/getarcaneapp/apns-relay/internal/metrics"
+	"github.com/getarcaneapp/apns-relay/internal/push"
 	"github.com/getarcaneapp/apns-relay/internal/secrets"
 	"github.com/getarcaneapp/apns-relay/internal/server"
 	"github.com/getarcaneapp/apns-relay/internal/store"
@@ -61,10 +63,10 @@ func run(configPath string) error {
 	}
 	defer func() { _ = st.Close() }()
 
-	var sender apns.Sender
+	senders := make(map[string]push.Sender, 2)
 	switch cfg.APNS.Mode {
 	case config.APNSModeLive:
-		sender, err = apns.NewClient(apns.Config{
+		senders[push.PlatformAPNS], err = apns.NewClient(apns.Config{
 			KeyID:         cfg.APNS.KeyID,
 			TeamID:        cfg.APNS.TeamID,
 			Topic:         cfg.APNS.Topic,
@@ -77,13 +79,31 @@ func run(configPath string) error {
 		}
 	case config.APNSModeLog:
 		log.WarnContext(ctx, "APNs log mode enabled: notifications will NOT be delivered")
-		sender = &apns.LogSender{Log: log}
+		senders[push.PlatformAPNS] = &apns.LogSender{Log: log}
+	}
+	switch cfg.FCM.Mode {
+	case config.FCMModeLive:
+		senders[push.PlatformFCM], err = fcm.NewClient(fcm.Config{
+			ProjectID:     cfg.FCM.ProjectID,
+			ClientEmail:   cfg.FCM.ClientEmail,
+			PrivateKey:    cfg.FCM.PrivateKey,
+			TokenURL:      cfg.FCM.TokenURL,
+			TokenAudience: cfg.FCM.TokenAudience,
+			BaseURL:       cfg.FCM.BaseURL,
+		})
+		if err != nil {
+			return err
+		}
+	case config.FCMModeLog:
+		log.WarnContext(ctx, "FCM log mode enabled: Android notifications will NOT be delivered")
+		senders[push.PlatformFCM] = &fcm.LogSender{Log: log}
+	case config.FCMModeDisabled:
 	}
 
 	reg := metrics.New()
 	wk := worker.New(worker.Options{
 		Store:       st,
-		Sender:      sender,
+		Senders:     senders,
 		Sealer:      sealer,
 		Metrics:     reg,
 		Logger:      log.With("component", "worker"),
@@ -116,7 +136,9 @@ func run(configPath string) error {
 			"addr", cfg.ListenAddr,
 			"version", config.Version,
 			"apnsMode", string(cfg.APNS.Mode),
-			"apnsTopic", cfg.APNS.Topic)
+			"apnsTopic", cfg.APNS.Topic,
+			"fcmMode", string(cfg.FCM.Mode),
+			"fcmProject", cfg.FCM.ProjectID)
 		if serveErr := httpServer.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			errCh <- serveErr
 		}

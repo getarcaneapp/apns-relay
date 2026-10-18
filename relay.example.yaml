@@ -1,5 +1,5 @@
 # Arcane APNs relay configuration.
-# Every key is optional; environment variables (RELAY_* / APNS_*) override file values.
+# Every key is optional; environment variables (RELAY_* / APNS_* / FCM_*) override file values.
 
 listen: ":3554"
 database_path: ./data/relay.db
@@ -10,7 +10,7 @@ database_path: ./data/relay.db
 
 max_envelope_age: 5m     # reject envelopes whose occurredAt is older than this
 max_body_bytes: 65536
-workers: 8               # concurrent APNs sends
+workers: 8               # concurrent APNs / FCM sends
 max_attempts: 8          # retries for 5xx/429 before a delivery is marked failed
 retention: 24h           # how long finished deliveries / event ids are kept for idempotency
 trust_proxy_headers: false  # set true only behind a proxy that overwrites X-Forwarded-For
@@ -36,3 +36,14 @@ apns:
   #   -----END PRIVATE KEY-----
   # sandbox_url: https://api.sandbox.push.apple.com
   # production_url: https://api.push.apple.com
+
+# Android delivery through Firebase Cloud Messaging (HTTP v1). Disabled by default;
+# while disabled, installations with platform "fcm" are rejected.
+fcm:
+  mode: disabled         # disabled | live | log  (log = print instead of sending; local dev only)
+  # Service-account key from Firebase console > Project settings > Service accounts.
+  service_account_file: /run/secrets/fcm-service-account.json
+  # service_account: '{"type":"service_account", ...}'
+  # project_id: my-firebase-project   # defaults to the service account's project_id
+  # token_url: https://oauth2.googleapis.com/token   # testing only; the JWT audience stays the key's token_uri
+  # base_url: https://fcm.googleapis.com

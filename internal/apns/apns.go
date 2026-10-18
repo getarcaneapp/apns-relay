@@ -21,6 +21,8 @@ import (
 	"time"
 
 	kit "go.getarcane.app/kit/pkg"
+
+	"github.com/getarcaneapp/apns-relay/internal/push"
 )
 
 // Environment selects the APNs host.
@@ -35,42 +37,6 @@ const (
 // ValidEnvironment reports whether e is a known environment.
 func ValidEnvironment(e string) bool {
 	return e == string(EnvironmentSandbox) || e == string(EnvironmentProduction)
-}
-
-// Notification is a single push request.
-type Notification struct {
-	DeviceToken string
-	Environment Environment
-	Payload     []byte
-	CollapseID  string
-	Expiration  time.Time
-}
-
-// Outcome classifies an APNs response for the delivery worker.
-type Outcome int
-
-const (
-	// OutcomeSent means APNs accepted the notification.
-	OutcomeSent Outcome = iota
-	// OutcomeRetry means a transient failure; try again later.
-	OutcomeRetry
-	// OutcomeInvalidToken means the device token is dead; remove the installation.
-	OutcomeInvalidToken
-	// OutcomeFailed means a permanent, non-token failure.
-	OutcomeFailed
-)
-
-// Result describes what APNs said.
-type Result struct {
-	Outcome    Outcome
-	StatusCode int
-	Reason     string
-	APNSID     string
-}
-
-// Sender is implemented by the live client and the log-only client.
-type Sender interface {
-	Send(ctx context.Context, n Notification) (Result, error)
 }
 
 // Config for the live client.
@@ -116,15 +82,15 @@ func NewClient(cfg Config) (*Client, error) {
 }
 
 // Send delivers one notification.
-func (c *Client) Send(ctx context.Context, n Notification) (Result, error) {
-	base := kit.Ternary(n.Environment == EnvironmentSandbox, c.cfg.SandboxURL, c.cfg.ProductionURL)
+func (c *Client) Send(ctx context.Context, n push.Notification) (push.Result, error) {
+	base := kit.Ternary(n.Environment == string(EnvironmentSandbox), c.cfg.SandboxURL, c.cfg.ProductionURL)
 	token, err := c.tokens.Token()
 	if err != nil {
-		return Result{Outcome: OutcomeRetry}, err
+		return push.Result{Outcome: push.OutcomeRetry}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/3/device/"+n.DeviceToken, bytes.NewReader(n.Payload))
 	if err != nil {
-		return Result{Outcome: OutcomeFailed}, err
+		return push.Result{Outcome: push.OutcomeFailed}, err
 	}
 	req.Header.Set("Authorization", "bearer "+token)
 	req.Header.Set("Apns-Topic", c.cfg.Topic)
@@ -139,13 +105,13 @@ func (c *Client) Send(ctx context.Context, n Notification) (Result, error) {
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return Result{Outcome: OutcomeRetry, Reason: "transport"}, err
+		return push.Result{Outcome: push.OutcomeRetry, Reason: "transport"}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	res := Result{StatusCode: resp.StatusCode, APNSID: resp.Header.Get("Apns-Id")}
+	res := push.Result{StatusCode: resp.StatusCode, ID: resp.Header.Get("Apns-Id")}
 	if resp.StatusCode == http.StatusOK {
-		res.Outcome = OutcomeSent
+		res.Outcome = push.OutcomeSent
 		return res, nil
 	}
 	var parsed struct {
@@ -155,17 +121,17 @@ func (c *Client) Send(ctx context.Context, n Notification) (Result, error) {
 	res.Reason = parsed.Reason
 	switch parsed.Reason {
 	case "BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic", "ExpiredToken":
-		res.Outcome = OutcomeInvalidToken
+		res.Outcome = push.OutcomeInvalidToken
 	case "ExpiredProviderToken", "TooManyProviderTokenUpdates", "TooManyRequests", "InternalServerError", "ServiceUnavailable", "Shutdown", "IdleTimeout":
-		res.Outcome = OutcomeRetry
+		res.Outcome = push.OutcomeRetry
 	default:
 		switch {
 		case resp.StatusCode == http.StatusGone:
-			res.Outcome = OutcomeInvalidToken
+			res.Outcome = push.OutcomeInvalidToken
 		case resp.StatusCode == http.StatusTooManyRequests, resp.StatusCode >= 500:
-			res.Outcome = OutcomeRetry
+			res.Outcome = push.OutcomeRetry
 		default:
-			res.Outcome = OutcomeFailed
+			res.Outcome = push.OutcomeFailed
 		}
 	}
 	if resp.StatusCode == http.StatusForbidden && parsed.Reason == "ExpiredProviderToken" {
@@ -233,10 +199,10 @@ type LogSender struct {
 }
 
 // Send logs the delivery metadata (never the payload or token) and reports success.
-func (l *LogSender) Send(ctx context.Context, n Notification) (Result, error) {
+func (l *LogSender) Send(ctx context.Context, n push.Notification) (push.Result, error) {
 	l.Log.InfoContext(ctx, "apns log mode: would send",
-		"environment", string(n.Environment),
+		"environment", n.Environment,
 		"payloadBytes", len(n.Payload),
 		"collapseId", n.CollapseID)
-	return Result{Outcome: OutcomeSent, StatusCode: http.StatusOK, APNSID: "log-mode"}, nil
+	return push.Result{Outcome: push.OutcomeSent, StatusCode: http.StatusOK, ID: "log-mode"}, nil
 }

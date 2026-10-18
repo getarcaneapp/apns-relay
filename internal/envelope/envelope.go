@@ -1,4 +1,4 @@
-// Package envelope defines the signed v1 event envelope and its APNs projection.
+// Package envelope defines the signed v1 event envelope and its APNs and FCM projections.
 package envelope
 
 import (
@@ -20,6 +20,9 @@ const Version = 1
 
 // MaxAPNSPayloadBytes is Apple's hard limit for alert pushes.
 const MaxAPNSPayloadBytes = 4096
+
+// MaxFCMPayloadBytes is Google's limit for the data portion of a message.
+const MaxFCMPayloadBytes = 4096
 
 // Field limits enforced on incoming envelopes.
 const (
@@ -71,7 +74,7 @@ var (
 // Errors returned by Parse and BuildAPNSPayload.
 var (
 	ErrInvalid      = errors.New("invalid envelope")
-	ErrPayloadLimit = errors.New("apns payload exceeds 4096 bytes")
+	ErrPayloadLimit = errors.New("push payload exceeds 4096 bytes")
 )
 
 // Resource identifies the object an event is about.
@@ -278,8 +281,25 @@ func ThreadID(e *Envelope) string {
 	return e.EnvironmentID + ":" + e.Type
 }
 
-// BuildAPNSPayload projects the envelope into a compact alert payload.
+// arcaneData is the routing data shared by the APNs and FCM payloads.
 // Recipient ids are intentionally omitted: a device must not learn about other recipients.
+func arcaneData(e *Envelope) ArcaneData {
+	return ArcaneData{
+		Version:         Version,
+		EventID:         e.EventID,
+		OccurredAt:      e.OccurredAt.UTC(),
+		Type:            e.Type,
+		Severity:        e.Severity,
+		EnvironmentID:   e.EnvironmentID,
+		EnvironmentName: e.EnvironmentName,
+		Resource:        e.Resource,
+		Route:           e.Route,
+		ChannelID:       e.ChannelID,
+		DedupeKey:       DedupeKey(e),
+	}
+}
+
+// BuildAPNSPayload projects the envelope into a compact alert payload.
 func BuildAPNSPayload(e *Envelope) ([]byte, error) {
 	p := APNSPayload{
 		APS: APS{
@@ -289,19 +309,7 @@ func BuildAPNSPayload(e *Envelope) ([]byte, error) {
 			InterruptionLevel: "active",
 			MutableContent:    1,
 		},
-		Arcane: ArcaneData{
-			Version:         Version,
-			EventID:         e.EventID,
-			OccurredAt:      e.OccurredAt.UTC(),
-			Type:            e.Type,
-			Severity:        e.Severity,
-			EnvironmentID:   e.EnvironmentID,
-			EnvironmentName: e.EnvironmentName,
-			Resource:        e.Resource,
-			Route:           e.Route,
-			ChannelID:       e.ChannelID,
-			DedupeKey:       DedupeKey(e),
-		},
+		Arcane: arcaneData(e),
 	}
 	b, err := json.Marshal(p)
 	if err != nil {
@@ -311,4 +319,57 @@ func BuildAPNSPayload(e *Envelope) ([]byte, error) {
 		return nil, ErrPayloadLimit
 	}
 	return b, nil
+}
+
+// AndroidChannelID is the notification channel the Android app creates for
+// Arcane alerts.
+const AndroidChannelID = "arcane"
+
+// FCMData is the data map of an FCM message. FCM only allows string values. The
+// keys follow expo-notifications, which presents data-only messages itself: tag
+// replaces an alert already in the tray, threadIdentifier groups alerts, and body
+// is a JSON object string that the app receives as the notification's data.
+type FCMData struct {
+	Title            string `json:"title"`
+	Message          string `json:"message"`
+	Tag              string `json:"tag"`
+	ThreadIdentifier string `json:"threadIdentifier"`
+	ChannelID        string `json:"channelId"`
+	Body             string `json:"body"`
+}
+
+// FCMBody is the object encoded into FCMData.Body. It mirrors the APNs payload,
+// so the app reads the routing data from "arcane" on both platforms.
+type FCMBody struct {
+	Arcane ArcaneData `json:"arcane"`
+}
+
+// FCMPayload is the stored FCM payload; the FCM client adds the token and
+// Android delivery options when it sends.
+type FCMPayload struct {
+	Data FCMData `json:"data"`
+}
+
+// BuildFCMPayload projects the envelope into a data-only message.
+func BuildFCMPayload(e *Envelope) ([]byte, error) {
+	body, err := json.Marshal(FCMBody{Arcane: arcaneData(e)})
+	if err != nil {
+		return nil, err
+	}
+	p := FCMPayload{Data: FCMData{
+		Title:            e.Title,
+		Message:          e.Body,
+		Tag:              DedupeKey(e),
+		ThreadIdentifier: ThreadID(e),
+		ChannelID:        AndroidChannelID,
+		Body:             string(body),
+	}}
+	data, err := json.Marshal(p.Data)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxFCMPayloadBytes {
+		return nil, ErrPayloadLimit
+	}
+	return json.Marshal(p)
 }

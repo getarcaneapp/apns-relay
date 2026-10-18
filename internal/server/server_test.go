@@ -19,7 +19,9 @@ import (
 
 	"github.com/getarcaneapp/apns-relay/internal/apns"
 	"github.com/getarcaneapp/apns-relay/internal/config"
+	"github.com/getarcaneapp/apns-relay/internal/envelope"
 	"github.com/getarcaneapp/apns-relay/internal/metrics"
+	"github.com/getarcaneapp/apns-relay/internal/push"
 	"github.com/getarcaneapp/apns-relay/internal/secrets"
 	"github.com/getarcaneapp/apns-relay/internal/server"
 	"github.com/getarcaneapp/apns-relay/internal/signing"
@@ -27,28 +29,35 @@ import (
 	"github.com/getarcaneapp/apns-relay/internal/worker"
 )
 
-// fakeAPNS records sends and answers with a configurable status/reason.
-type fakeAPNS struct {
+// fakeSender records sends and answers with a configurable status/reason.
+type fakeSender struct {
 	status atomic.Int32
 	reason atomic.Value
 	sent   atomic.Int32
-	last   atomic.Value // apns.Notification
+	last   atomic.Value // push.Notification
 }
 
-func (f *fakeAPNS) Send(_ context.Context, n apns.Notification) (apns.Result, error) {
+func newFakeSender() *fakeSender {
+	f := &fakeSender{}
+	f.status.Store(200)
+	f.reason.Store("")
+	return f
+}
+
+func (f *fakeSender) Send(_ context.Context, n push.Notification) (push.Result, error) {
 	f.sent.Add(1)
 	f.last.Store(n)
 	status := int(f.status.Load())
 	reason, _ := f.reason.Load().(string)
 	switch {
 	case status == 200:
-		return apns.Result{Outcome: apns.OutcomeSent, StatusCode: 200, APNSID: "x"}, nil
-	case status == 410 || reason == "BadDeviceToken":
-		return apns.Result{Outcome: apns.OutcomeInvalidToken, StatusCode: status, Reason: reason}, nil
+		return push.Result{Outcome: push.OutcomeSent, StatusCode: 200, ID: "x"}, nil
+	case status == 410 || reason == "BadDeviceToken" || reason == "UNREGISTERED":
+		return push.Result{Outcome: push.OutcomeInvalidToken, StatusCode: status, Reason: reason}, nil
 	case status >= 500 || status == 429:
-		return apns.Result{Outcome: apns.OutcomeRetry, StatusCode: status, Reason: reason}, nil
+		return push.Result{Outcome: push.OutcomeRetry, StatusCode: status, Reason: reason}, nil
 	default:
-		return apns.Result{Outcome: apns.OutcomeFailed, StatusCode: status, Reason: reason}, nil
+		return push.Result{Outcome: push.OutcomeFailed, StatusCode: status, Reason: reason}, nil
 	}
 }
 
@@ -57,30 +66,55 @@ type harness struct {
 	srv    *httptest.Server
 	store  *store.Store
 	worker *worker.Worker
-	apns   *fakeAPNS
+	apns   *fakeSender
+	fcm    *fakeSender
 	woken  atomic.Int32
 	now    time.Time
 }
 
-func newHarness(t *testing.T) *harness {
+type harnessSettings struct {
+	cfg    *config.Config
+	dbPath string
+}
+
+type harnessOption func(*harnessSettings)
+
+func withFCM(s *harnessSettings) { s.cfg.FCM.Mode = config.FCMModeLog }
+
+// withDB opens an existing database, e.g. to restart the relay with different config.
+func withDB(path string) harnessOption {
+	return func(s *harnessSettings) { s.dbPath = path }
+}
+
+func newHarness(t *testing.T, opts ...harnessOption) *harness {
 	t.Helper()
-	cfg := &config.Config{
-		MaxEnvelopeAge: 5 * time.Minute,
-		MaxBodyBytes:   64 * 1024,
-		RateLimits:     config.RateLimits{IPPerMinute: 1000, ChannelPerMinute: 1000, InstallationPerMinute: 1000},
+	settings := &harnessSettings{
+		cfg: &config.Config{
+			MaxEnvelopeAge: 5 * time.Minute,
+			MaxBodyBytes:   64 * 1024,
+			RateLimits:     config.RateLimits{IPPerMinute: 1000, ChannelPerMinute: 1000, InstallationPerMinute: 1000},
+			FCM:            config.FCM{Mode: config.FCMModeDisabled},
+		},
+		dbPath: t.TempDir() + "/relay.db",
 	}
-	st, err := store.Open(t.TempDir() + "/relay.db")
+	for _, opt := range opts {
+		opt(settings)
+	}
+	cfg := settings.cfg
+	st, err := store.Open(settings.dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	sealer, _ := secrets.NewSealer(bytes.Repeat([]byte{1}, 32))
 	reg := metrics.New()
-	fake := &fakeAPNS{}
-	fake.status.Store(200)
-	fake.reason.Store("")
-	h := &harness{t: t, store: st, apns: fake, now: time.Now()}
-	h.worker = worker.New(worker.Options{Store: st, Sender: fake, Sealer: sealer, Metrics: reg, Logger: slog.New(slog.DiscardHandler), MaxAttempts: 3})
+	h := &harness{t: t, store: st, apns: newFakeSender(), fcm: newFakeSender(), now: time.Now()}
+	// Like cmd/main.go, the worker only gets an FCM sender when FCM is enabled.
+	senders := map[string]push.Sender{push.PlatformAPNS: h.apns}
+	if cfg.FCM.Enabled() {
+		senders[push.PlatformFCM] = h.fcm
+	}
+	h.worker = worker.New(worker.Options{Store: st, Senders: senders, Sealer: sealer, Metrics: reg, Logger: slog.New(slog.DiscardHandler), MaxAttempts: 3})
 	s := server.New(server.Options{
 		Config: cfg, Store: st, Sealer: sealer, Metrics: reg,
 		Logger: slog.New(slog.DiscardHandler),
@@ -176,9 +210,13 @@ func (d device) auth() map[string]string {
 	return map[string]string{"Authorization": "Bearer " + d.id + "." + d.secret}
 }
 
-func (h *harness) enroll(token string) device {
+func (h *harness) enroll(platform, token string) device {
 	h.t.Helper()
-	r := h.do("POST", "/v1/installations", map[string]string{"platform": "apns", "apnsEnvironment": "sandbox", "deviceToken": token, "appVersion": "1.0.0"}, nil)
+	body := map[string]string{"platform": platform, "deviceToken": token, "appVersion": "1.0.0"}
+	if platform == push.PlatformAPNS {
+		body["apnsEnvironment"] = "sandbox"
+	}
+	r := h.do("POST", "/v1/installations", body, nil)
 	if r.code != http.StatusCreated {
 		h.t.Fatalf("enroll: %d %v", r.code, r.body)
 	}
@@ -228,7 +266,7 @@ func testFullFlow(t *testing.T, alg signing.Algorithm) {
 		t.Fatalf("re-register: %d %v", again.code, again.body)
 	}
 
-	d := h.enroll(strings.Repeat("ab", 32))
+	d := h.enroll(push.PlatformAPNS, strings.Repeat("ab", 32))
 	h.pair(m, &d)
 
 	raw, hdr := m.signed(t, h.envelope(m, "evt-1", d.recipient, "rcp_missing"))
@@ -254,8 +292,8 @@ func testFullFlow(t *testing.T, alg signing.Algorithm) {
 	if h.apns.sent.Load() != 1 {
 		t.Fatalf("expected 1 send, got %d", h.apns.sent.Load())
 	}
-	n := h.apns.last.Load().(apns.Notification)
-	if n.DeviceToken != strings.Repeat("ab", 32) || n.Environment != apns.EnvironmentSandbox ||
+	n := h.apns.last.Load().(push.Notification)
+	if n.DeviceToken != strings.Repeat("ab", 32) || n.Environment != string(apns.EnvironmentSandbox) ||
 		!strings.HasPrefix(n.CollapseID, "d-") || len(n.CollapseID) > 64 {
 		t.Fatalf("unexpected notification: %+v", n)
 	}
@@ -298,7 +336,7 @@ func TestSignatureAndAuthFailures(t *testing.T) {
 	h := newHarness(t)
 	m := newManager(t, signing.AlgEd25519)
 	h.register(m)
-	d := h.enroll(strings.Repeat("cd", 32))
+	d := h.enroll(push.PlatformAPNS, strings.Repeat("cd", 32))
 	h.pair(m, &d)
 
 	raw, hdr := m.signed(t, h.envelope(m, "evt-1", d.recipient))
@@ -343,7 +381,7 @@ func TestSignatureAndAuthFailures(t *testing.T) {
 	if r := h.do("POST", "/v1/unpair", map[string]string{"recipientId": d.recipient}, bad.auth()); r.code != http.StatusUnauthorized {
 		t.Fatalf("bad secret: %d", r.code)
 	}
-	other2 := h.enroll(strings.Repeat("ef", 32))
+	other2 := h.enroll(push.PlatformAPNS, strings.Repeat("ef", 32))
 	if r := h.do("DELETE", "/v1/installations/"+d.id, nil, other2.auth()); r.code != http.StatusForbidden {
 		t.Fatalf("cross-installation delete: %d", r.code)
 	}
@@ -355,9 +393,15 @@ func TestSignatureAndAuthFailures(t *testing.T) {
 	if r := h.do("POST", "/v1/pair", map[string]string{"pairingToken": tok}, d.auth()); r.code != http.StatusConflict {
 		t.Fatalf("replayed pairing token: %d %v", r.code, r.body)
 	}
-	// Unsupported platform.
+	// Unsupported platforms: FCM is disabled in this harness.
 	if r := h.do("POST", "/v1/installations", map[string]string{"platform": "fcm", "apnsEnvironment": "sandbox", "deviceToken": "abcd"}, nil); r.code != http.StatusBadRequest {
 		t.Fatalf("fcm: %d", r.code)
+	}
+	if r := h.do("POST", "/v1/installations", map[string]string{"platform": "fcm", "deviceToken": fcmToken}, nil); r.code != http.StatusBadRequest {
+		t.Fatalf("fcm while disabled: %d %v", r.code, r.body)
+	}
+	if r := h.do("POST", "/v1/installations", map[string]string{"platform": "webpush", "deviceToken": fcmToken}, nil); r.code != http.StatusBadRequest {
+		t.Fatalf("unknown platform: %d %v", r.code, r.body)
 	}
 }
 
@@ -365,7 +409,7 @@ func TestWorkerInvalidTokenRemovesInstallation(t *testing.T) {
 	h := newHarness(t)
 	m := newManager(t, signing.AlgEd25519)
 	h.register(m)
-	d := h.enroll(strings.Repeat("11", 32))
+	d := h.enroll(push.PlatformAPNS, strings.Repeat("11", 32))
 	h.pair(m, &d)
 	raw, hdr := m.signed(t, h.envelope(m, "evt-1", d.recipient))
 	h.do("POST", "/v1/events", raw, hdr)
@@ -395,7 +439,7 @@ func TestWorkerRetriesThenFails(t *testing.T) {
 	h := newHarness(t)
 	m := newManager(t, signing.AlgEd25519)
 	h.register(m)
-	d := h.enroll(strings.Repeat("22", 32))
+	d := h.enroll(push.PlatformAPNS, strings.Repeat("22", 32))
 	h.pair(m, &d)
 	raw, hdr := m.signed(t, h.envelope(m, "evt-1", d.recipient))
 	h.do("POST", "/v1/events", raw, hdr)
@@ -428,7 +472,7 @@ func TestTokenRotation(t *testing.T) {
 	h := newHarness(t)
 	m := newManager(t, signing.AlgEd25519)
 	h.register(m)
-	d := h.enroll(strings.Repeat("33", 32))
+	d := h.enroll(push.PlatformAPNS, strings.Repeat("33", 32))
 	h.pair(m, &d)
 	newTok := strings.Repeat("44", 32)
 	if r := h.do("PUT", "/v1/installations/"+d.id+"/token", map[string]string{"deviceToken": newTok, "apnsEnvironment": "production", "appVersion": "1.1.0"}, d.auth()); r.code != http.StatusNoContent {
@@ -439,8 +483,8 @@ func TestTokenRotation(t *testing.T) {
 	if _, err := h.worker.Drain(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	n := h.apns.last.Load().(apns.Notification)
-	if n.DeviceToken != newTok || n.Environment != apns.EnvironmentProduction {
+	n := h.apns.last.Load().(push.Notification)
+	if n.DeviceToken != newTok || n.Environment != string(apns.EnvironmentProduction) {
 		t.Fatalf("rotated token not used: %+v", n)
 	}
 }
@@ -450,16 +494,23 @@ func TestHealthAndMetrics(t *testing.T) {
 	if r := h.do("GET", "/healthz", nil, nil); r.code != http.StatusOK || r.body["status"] != "ok" {
 		t.Fatalf("health: %d %v", r.code, r.body)
 	}
-	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, h.srv.URL+"/metrics", http.NoBody)
+	b := h.metrics()
+	if !strings.Contains(b, "relay_events_accepted_total") || !strings.Contains(b, "relay_apns_responses_total") ||
+		!strings.Contains(b, "relay_fcm_responses_total") {
+		t.Fatalf("metrics missing: %s", b)
+	}
+}
+
+func (h *harness) metrics() string {
+	h.t.Helper()
+	req, _ := http.NewRequestWithContext(h.t.Context(), http.MethodGet, h.srv.URL+"/metrics", http.NoBody)
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
 	defer func() { _ = res.Body.Close() }()
 	b, _ := io.ReadAll(res.Body)
-	if !strings.Contains(string(b), "relay_events_accepted_total") {
-		t.Fatalf("metrics missing: %s", b)
-	}
+	return string(b)
 }
 
 func TestBodyLimit(t *testing.T) {
@@ -467,5 +518,182 @@ func TestBodyLimit(t *testing.T) {
 	big := bytes.Repeat([]byte("a"), 70*1024)
 	if r := h.do("POST", "/v1/channels", big, nil); r.code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413, got %d", r.code)
+	}
+}
+
+// fcmToken looks like a real FCM registration token: mixed case, ':' '-' and '_'.
+var fcmToken = "eXaMpLe-Dev1ce:APA91b" + strings.Repeat("Hq_7-Zk", 20)
+
+func TestFCMFlow(t *testing.T) {
+	h := newHarness(t, withFCM)
+	m := newManager(t, signing.AlgEd25519)
+	h.register(m)
+	d := h.enroll(push.PlatformFCM, fcmToken)
+	h.pair(m, &d)
+
+	raw, hdr := m.signed(t, h.envelope(m, "evt-1", d.recipient))
+	if r := h.do("POST", "/v1/events", raw, hdr); r.code != http.StatusAccepted || r.body["queued"].(float64) != 1 {
+		t.Fatalf("events: %d %v", r.code, r.body)
+	}
+	if _, err := h.worker.Drain(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if h.fcm.sent.Load() != 1 || h.apns.sent.Load() != 0 {
+		t.Fatalf("sends: fcm=%d apns=%d", h.fcm.sent.Load(), h.apns.sent.Load())
+	}
+	n := h.fcm.last.Load().(push.Notification)
+	// FCM tokens are case-sensitive and must reach Google exactly as registered.
+	if n.DeviceToken != fcmToken || n.Environment != "" {
+		t.Fatalf("unexpected notification: %+v", n)
+	}
+	var p envelope.FCMPayload
+	if err := json.Unmarshal(n.Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Data.Title != "Container updated" || p.Data.Tag != n.CollapseID || p.Data.ThreadIdentifier != "env-1:container_update" {
+		t.Fatalf("unexpected payload: %s", n.Payload)
+	}
+	if strings.Contains(string(n.Payload), d.recipient) {
+		t.Fatal("payload leaked recipient id")
+	}
+
+	// A test push goes out over FCM as well.
+	raw, hdr = m.signed(t, map[string]any{"channelId": m.channelID, "issuedAt": h.now.UTC(), "nonce": "abc123", "recipientId": d.recipient})
+	if r := h.do("POST", "/v1/test", raw, hdr); r.code != http.StatusAccepted {
+		t.Fatalf("test: %d %v", r.code, r.body)
+	}
+	if _, err := h.worker.Drain(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if h.fcm.sent.Load() != 2 {
+		t.Fatalf("test push not sent over fcm: %d", h.fcm.sent.Load())
+	}
+}
+
+func TestFCMRecipientsSkippedWhileDisabled(t *testing.T) {
+	dbPath := t.TempDir() + "/relay.db"
+	before := newHarness(t, withFCM, withDB(dbPath))
+	m := newManager(t, signing.AlgEd25519)
+	before.register(m)
+	ios := before.enroll(push.PlatformAPNS, strings.Repeat("ab", 32))
+	before.pair(m, &ios)
+	android := before.enroll(push.PlatformFCM, fcmToken)
+	before.pair(m, &android)
+
+	// The relay restarts with FCM disabled; the Android installation is still paired.
+	h := newHarness(t, withDB(dbPath))
+	raw, hdr := m.signed(t, h.envelope(m, "evt-1", ios.recipient, android.recipient))
+	r := h.do("POST", "/v1/events", raw, hdr)
+	if r.code != http.StatusAccepted || r.body["queued"].(float64) != 1 || len(r.body["unknownRecipientIds"].([]any)) != 0 {
+		t.Fatalf("events: %d %v", r.code, r.body)
+	}
+	if _, err := h.worker.Drain(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if h.apns.sent.Load() != 1 || h.fcm.sent.Load() != 0 {
+		t.Fatalf("sends: apns=%d fcm=%d", h.apns.sent.Load(), h.fcm.sent.Load())
+	}
+}
+
+func TestMixedPlatformRecipients(t *testing.T) {
+	h := newHarness(t, withFCM)
+	m := newManager(t, signing.AlgEd25519)
+	h.register(m)
+	ios := h.enroll(push.PlatformAPNS, strings.Repeat("ab", 32))
+	h.pair(m, &ios)
+	android := h.enroll(push.PlatformFCM, fcmToken)
+	h.pair(m, &android)
+
+	raw, hdr := m.signed(t, h.envelope(m, "evt-1", ios.recipient, android.recipient))
+	if r := h.do("POST", "/v1/events", raw, hdr); r.code != http.StatusAccepted || r.body["queued"].(float64) != 2 {
+		t.Fatalf("events: %d %v", r.code, r.body)
+	}
+	if _, err := h.worker.Drain(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if h.apns.sent.Load() != 1 || h.fcm.sent.Load() != 1 {
+		t.Fatalf("sends: apns=%d fcm=%d", h.apns.sent.Load(), h.fcm.sent.Load())
+	}
+	// Each platform counts into its own series; the APNs line format is what dashboards parse.
+	metricsText := h.metrics()
+	for _, line := range []string{"\nrelay_apns_responses_total{status=\"200\",reason=\"\"} 1\n", "\nrelay_fcm_responses_total{status=\"200\",reason=\"\"} 1\n"} {
+		if !strings.Contains(metricsText, line) {
+			t.Fatalf("metrics missing %q:\n%s", line, metricsText)
+		}
+	}
+	var apnsPayload envelope.APNSPayload
+	if err := json.Unmarshal(h.apns.last.Load().(push.Notification).Payload, &apnsPayload); err != nil || apnsPayload.APS.Alert.Title == "" {
+		t.Fatalf("apns got a non-APNs payload: %v", err)
+	}
+	var fcmPayload envelope.FCMPayload
+	if err := json.Unmarshal(h.fcm.last.Load().(push.Notification).Payload, &fcmPayload); err != nil || fcmPayload.Data.Body == "" {
+		t.Fatalf("fcm got a non-FCM payload: %v", err)
+	}
+	if apnsPayload.Arcane.DedupeKey != fcmPayload.Data.Tag {
+		t.Fatal("both platforms should share the dedupe key")
+	}
+}
+
+func TestFCMRegistrationRules(t *testing.T) {
+	h := newHarness(t, withFCM)
+	cases := map[string]map[string]string{
+		"apnsEnvironment": {"platform": "fcm", "apnsEnvironment": "sandbox", "deviceToken": fcmToken},
+		"short token":     {"platform": "fcm", "deviceToken": "abc:def"},
+		"bad characters":  {"platform": "fcm", "deviceToken": fcmToken + "/=="},
+	}
+	for name, body := range cases {
+		if r := h.do("POST", "/v1/installations", body, nil); r.code != http.StatusBadRequest {
+			t.Errorf("%s: %d %v", name, r.code, r.body)
+		}
+	}
+	// APNs still requires its environment.
+	if r := h.do("POST", "/v1/installations", map[string]string{"deviceToken": strings.Repeat("ab", 32)}, nil); r.code != http.StatusBadRequest {
+		t.Fatalf("apns without environment: %d", r.code)
+	}
+
+	d := h.enroll(push.PlatformFCM, fcmToken)
+	if r := h.do("PUT", "/v1/installations/"+d.id+"/token", map[string]string{"deviceToken": fcmToken, "apnsEnvironment": "production"}, d.auth()); r.code != http.StatusBadRequest {
+		t.Fatalf("fcm rotation with apnsEnvironment: %d %v", r.code, r.body)
+	}
+	if r := h.do("PUT", "/v1/installations/"+d.id+"/token", map[string]string{"deviceToken": strings.Repeat("ab", 16)}, d.auth()); r.code != http.StatusBadRequest {
+		t.Fatalf("fcm rotation to a short token: %d %v", r.code, r.body)
+	}
+	rotated := "NeW" + fcmToken
+	if r := h.do("PUT", "/v1/installations/"+d.id+"/token", map[string]string{"deviceToken": rotated, "appVersion": "1.1.0"}, d.auth()); r.code != http.StatusNoContent {
+		t.Fatalf("fcm rotation: %d %v", r.code, r.body)
+	}
+	m := newManager(t, signing.AlgEd25519)
+	h.register(m)
+	h.pair(m, &d)
+	raw, hdr := m.signed(t, h.envelope(m, "evt-1", d.recipient))
+	h.do("POST", "/v1/events", raw, hdr)
+	if _, err := h.worker.Drain(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if n := h.fcm.last.Load().(push.Notification); n.DeviceToken != rotated {
+		t.Fatalf("rotated token not used as-is: %q", n.DeviceToken)
+	}
+}
+
+func TestWorkerInvalidFCMTokenRemovesInstallation(t *testing.T) {
+	h := newHarness(t, withFCM)
+	m := newManager(t, signing.AlgEd25519)
+	h.register(m)
+	d := h.enroll(push.PlatformFCM, fcmToken)
+	h.pair(m, &d)
+	raw, hdr := m.signed(t, h.envelope(m, "evt-1", d.recipient))
+	h.do("POST", "/v1/events", raw, hdr)
+
+	h.fcm.status.Store(404)
+	h.fcm.reason.Store("UNREGISTERED")
+	if _, err := h.worker.Drain(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.GetInstallation(t.Context(), d.id); err == nil {
+		t.Fatal("installation should have been removed")
+	}
+	ds, _ := h.store.ListDeliveriesByEvent(t.Context(), m.channelID, "evt-1")
+	if len(ds) != 1 || ds[0].Status != store.DeliveryDropped {
+		t.Fatalf("delivery state: %+v", ds)
 	}
 }

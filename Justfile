@@ -3,11 +3,12 @@ set working-directory := './'
 _default:
     @just --list
 
-# Run the relay locally in APNs log mode (no Apple credentials needed)
+# Run the relay locally in APNs and FCM log mode (no Apple or Google credentials needed)
 [group('dev')]
 dev:
     RELAY_ENCRYPTION_KEY=${RELAY_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000} \
     APNS_MODE=${APNS_MODE:-log} \
+    FCM_MODE=${FCM_MODE:-log} \
     RELAY_LOG_FORMAT=text RELAY_LOG_LEVEL=debug \
     go run ./cmd
 

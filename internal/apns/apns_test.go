@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/getarcaneapp/apns-relay/internal/push"
 )
 
 func TestProviderTokenIsValidES256AndCached(t *testing.T) {
@@ -76,20 +78,20 @@ func TestClientSendClassification(t *testing.T) {
 	cases := []struct {
 		status int
 		reason string
-		want   Outcome
+		want   push.Outcome
 	}{
-		{200, "", OutcomeSent},
-		{410, "Unregistered", OutcomeInvalidToken},
-		{400, "BadDeviceToken", OutcomeInvalidToken},
-		{403, "ExpiredProviderToken", OutcomeRetry},
-		{429, "TooManyRequests", OutcomeRetry},
-		{503, "ServiceUnavailable", OutcomeRetry},
-		{400, "PayloadTooLarge", OutcomeFailed},
-		{400, "TopicDisallowed", OutcomeFailed},
+		{200, "", push.OutcomeSent},
+		{410, "Unregistered", push.OutcomeInvalidToken},
+		{400, "BadDeviceToken", push.OutcomeInvalidToken},
+		{403, "ExpiredProviderToken", push.OutcomeRetry},
+		{429, "TooManyRequests", push.OutcomeRetry},
+		{503, "ServiceUnavailable", push.OutcomeRetry},
+		{400, "PayloadTooLarge", push.OutcomeFailed},
+		{400, "TopicDisallowed", push.OutcomeFailed},
 	}
 	for _, tc := range cases {
 		status, reason = tc.status, tc.reason
-		res, sendErr := c.Send(t.Context(), Notification{DeviceToken: "abcd", Environment: EnvironmentSandbox, Payload: []byte(`{}`), CollapseID: "evt", Expiration: time.Now().Add(time.Hour)})
+		res, sendErr := c.Send(t.Context(), push.Notification{DeviceToken: "abcd", Environment: string(EnvironmentSandbox), Payload: []byte(`{}`), CollapseID: "evt", Expiration: time.Now().Add(time.Hour)})
 		if sendErr != nil {
 			t.Fatalf("%d %s: %v", tc.status, tc.reason, sendErr)
 		}

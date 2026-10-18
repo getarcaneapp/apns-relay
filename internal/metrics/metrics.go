@@ -28,22 +28,29 @@ type Registry struct {
 	QueueLatencyCount   atomic.Int64
 
 	mu         sync.Mutex
-	apnsStatus map[string]*atomic.Int64
+	pushStatus map[string]*atomic.Int64
+}
+
+// responseSeries maps each platform to its responses counter, so the APNs series
+// keeps the name existing dashboards query.
+var responseSeries = []struct{ platform, name, help string }{
+	{"apns", "relay_apns_responses_total", "APNs responses by status and reason."},
+	{"fcm", "relay_fcm_responses_total", "FCM responses by status and reason."},
 }
 
 // New creates an empty registry.
 func New() *Registry {
-	return &Registry{apnsStatus: make(map[string]*atomic.Int64)}
+	return &Registry{pushStatus: make(map[string]*atomic.Int64)}
 }
 
-// ObserveAPNSStatus counts an APNs response by HTTP status and reason.
-func (r *Registry) ObserveAPNSStatus(status int, reason string) {
-	key := strconv.Itoa(status) + "|" + reason
+// ObservePushStatus counts a push service response by platform, HTTP status and reason.
+func (r *Registry) ObservePushStatus(platform string, status int, reason string) {
+	key := platform + "|" + strconv.Itoa(status) + "|" + reason
 	r.mu.Lock()
-	c, ok := r.apnsStatus[key]
+	c, ok := r.pushStatus[key]
 	if !ok {
 		c = &atomic.Int64{}
-		r.apnsStatus[key] = c
+		r.pushStatus[key] = c
 	}
 	r.mu.Unlock()
 	c.Add(1)
@@ -72,11 +79,11 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 		{"relay_events_duplicate_total", "Envelopes ignored as duplicates.", &r.EventsDuplicate},
 		{"relay_events_rejected_total", "Envelopes rejected for validation or auth failures.", &r.EventsRejected},
 		{"relay_deliveries_queued_total", "Per-recipient deliveries queued.", &r.DeliveriesQueued},
-		{"relay_deliveries_sent_total", "Deliveries accepted by APNs.", &r.DeliveriesSent},
+		{"relay_deliveries_sent_total", "Deliveries accepted by the push service.", &r.DeliveriesSent},
 		{"relay_deliveries_retried_total", "Delivery attempts scheduled for retry.", &r.DeliveriesRetried},
 		{"relay_deliveries_failed_total", "Deliveries permanently failed.", &r.DeliveriesFailed},
 		{"relay_deliveries_dropped_total", "Deliveries dropped because the recipient disappeared.", &r.DeliveriesDropped},
-		{"relay_invalid_tokens_removed_total", "Installations removed after APNs reported an invalid token.", &r.InvalidTokenRemoved},
+		{"relay_invalid_tokens_removed_total", "Installations removed after the push service reported an invalid token.", &r.InvalidTokenRemoved},
 		{"relay_rate_limit_hits_total", "Requests rejected by rate limiting.", &r.RateLimitHits},
 	}
 	for _, c := range counters {
@@ -90,15 +97,22 @@ func (r *Registry) WriteTo(w io.Writer) (int64, error) {
 		return n, err
 	}
 	r.mu.Lock()
-	statuses := maps.Clone(r.apnsStatus)
+	statuses := maps.Clone(r.pushStatus)
 	r.mu.Unlock()
-	if err := write("# HELP relay_apns_responses_total APNs responses by status and reason.\n# TYPE relay_apns_responses_total counter\n"); err != nil {
-		return n, err
-	}
-	for _, k := range slices.Sorted(maps.Keys(statuses)) {
-		status, reason, _ := strings.Cut(k, "|")
-		if err := write("relay_apns_responses_total{status=%q,reason=%q} %d\n", status, reason, statuses[k].Load()); err != nil {
+	keys := slices.Sorted(maps.Keys(statuses))
+	for _, series := range responseSeries {
+		if err := write("# HELP %s %s\n# TYPE %s counter\n", series.name, series.help, series.name); err != nil {
 			return n, err
+		}
+		for _, k := range keys {
+			platform, rest, _ := strings.Cut(k, "|")
+			if platform != series.platform {
+				continue
+			}
+			status, reason, _ := strings.Cut(rest, "|")
+			if err := write("%s{status=%q,reason=%q} %d\n", series.name, status, reason, statuses[k].Load()); err != nil {
+				return n, err
+			}
 		}
 	}
 	return n, nil
